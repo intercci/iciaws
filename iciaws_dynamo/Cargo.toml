@@ -1,0 +1,16 @@
+[package]
+name = "iciaws_dynamo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aws-config = { workspace = true }
+aws-sdk-dynamodb = { workspace = true }
+dotenv = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+serde_dynamo = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+chrono = { version = "0.4.44", features = ["serde"] }
+base64 = { workspace = true }

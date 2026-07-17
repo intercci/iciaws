@@ -1,0 +1,21 @@
+[package]
+name = "iciaws_test_helper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+http = { workspace = true }
+anyhow = { workspace = true }
+aws-sdk-dynamodb = { workspace = true }
+aws_lambda_events = { workspace = true }
+lambda_http = { workspace = true }
+serde_json = { workspace = true }
+serde_dynamo = { workspace = true }
+regex = "1.12.4"
+serial_test = "3.5.0"
+
+iciaws_router = { path = "../iciaws_router" }
+iciaws_dynamo = { path = "../iciaws_dynamo" }
+iciaws_ses = { path = "../iciaws_ses" }
+iciaws_s3 = { path = "../iciaws_s3" }
+iciaws_sns = { path = "../iciaws_sns" }
