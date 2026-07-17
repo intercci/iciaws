@@ -2,15 +2,19 @@
 
 A collection of Rust crates for building **AWS serverless backends** with Lambda, DynamoDB, S3, SES, SNS, and API Gateway.
 
-Pick only what you need — every crate is independent and published to [crates.io](https://crates.io). Add one or all via `cargo add`:
+Pick only what you need — every crate is independent. While not yet published to crates.io, add directly from this repo:
 
 ```bash
-cargo add iciaws_dynamo        # DynamoDB client with composite keys, pagination, batch ops
-cargo add iciaws_s3            # S3 client with presigned URLs, object CRUD, image listing
-cargo add iciaws_ses           # SES v2 client for email sending and receiving
-cargo add iciaws_sns           # SNS client for pub/sub notifications
-cargo add iciaws_router        # Lambda + API Gateway router with addon pattern
+cargo add iciaws_dynamo --git https://github.com/intercci/iciaws
+cargo add iciaws_s3 --git https://github.com/intercci/iciaws
+cargo add iciaws_ses --git https://github.com/intercci/iciaws
+cargo add iciaws_sns --git https://github.com/intercci/iciaws
+cargo add iciaws_router --git https://github.com/intercci/iciaws
+cargo add iciaws_macros --git https://github.com/intercci/iciaws
+cargo add iciaws_test_helper --git https://github.com/intercci/iciaws
 ```
+
+Once the crates are mature enough, they will be published to [crates.io](https://crates.io) for easier dependency management.
 
 ---
 
