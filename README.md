@@ -139,33 +139,47 @@ Lightweight router framework for AWS Lambda behind API Gateway. Maps HTTP routes
 ### Quick start
 
 ```rust
+use lambda_http::{Body, Error, Request, Response, run, service_fn};
+use iciaws_macros::route;
 use iciaws_router::router::Router;
-use iciaws_router::addons::Addons;
+use iciaws_router::addons::AddonHolder;
+use iciaws_dynamo::get_dynamo_client;
+use iciaws_s3::get_s3_client;
+
+#[route("GET/homes")]
+pub fn get_homes(input: RouteHandlerInput, addons: &AddonHolder) -> Result<RouteHandlerOutput> {
+    dbg!("Entered get_homes({:?})", &input);
+    let r =
+        RouteHandlerOutput::message_output(StatusCode::OK, "get_homes() returns OK".to_string());
+    Ok(r)
+}
+
+async fn function_handler(event: Request, router: &Router) -> Result<Response<Body>, Error> {
+    let rs = router.route(event).await;
+    let resp = rs.try_into()?;
+    dbg!(" <---- function_handler returns: {:?}", resp);
+    Ok(resp)
+}
 
 #[tokio::main]
 async fn main() {
-    let mut router = Router::new();
+    let tablename = "ici-users";
+    let dynamo_client = get_dynamo_client(Some(tablename)).await;
+    let s3_client = get_s3_client().await;
 
-    // Register a route with DynamoDB and S3 addons
-    router.get(
-        "/items/<id>",
-        get_item,
-        Addons::default()
-            .with_dynamo("my-table")
-            .with_s3(None),
-    );
+    let addons = AddonHolder::new();
+    addons.put_addon("dynamo", dynamo_client);
+    addons.put_addon("s3", s3_client);
 
-    lambda_http::run(router.into_service()).await?;
-}
+    let mut router = Router::new(addons);
+    router.add_route(GetHomesHandler::get_key(), Box::new(GetHomesHander));
 
-async fn get_item(
-    path_params: PathParams,
-    addons: Addons,
-) -> Result<Response, AppError> {
-    let dynamo = addons.dynamo.unwrap();
-    let id = path_params.get("id").unwrap();
-    // ... fetch and return
-    todo!()
+    let router_ref = &router;
+
+    run(service_fn(move |event| async move {
+        function_handler(event, router_ref).await
+    }))
+    .await
 }
 ```
 
