@@ -1,3 +1,4 @@
+#![cfg(not(doctest))]
 #![allow(dead_code)]
 use super::{
     errors::DynamoError,

@@ -36,6 +36,13 @@ pub fn base64_to_exclusive_start_key(last_evaluated_key_b64: &str) -> Result<Has
     Ok(m)
 }
 
+pub fn make_start_key(last_key_b64: Option<String>) -> Option<HashMap<String, AttributeValue>> {
+    match last_key_b64.as_deref() {
+        Some(s) => base64_to_exclusive_start_key(s).ok(),
+        None => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

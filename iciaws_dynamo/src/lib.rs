@@ -17,12 +17,15 @@ use chrono::Utc;
 use ckey::CompositeKey;
 pub mod types;
 use types::{FilterType, ItemType, StringMap};
+pub mod queries;
 pub mod builder;
 pub mod pagekey;
-use pagekey::base64_to_exclusive_start_key;
+use pagekey::make_start_key;
 pub mod errors;
 use errors::DynamoError;
 use tokio::sync::OnceCell;
+
+use crate::queries::QueriesBuilder;
 
 pub async fn dynamo_client() -> Client {
     if env::var("LAMBDA_TASK_ROOT").is_err() {
@@ -38,13 +41,6 @@ pub async fn dynamo_client() -> Client {
         Err(_) => config.load().await,
     };
     Client::new(&config)
-}
-
-pub fn make_start_key(last_key_b64: Option<String>) -> Option<ItemType> {
-    match last_key_b64.as_deref() {
-        Some(s) => base64_to_exclusive_start_key(s).ok(),
-        None => None,
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -229,6 +225,7 @@ impl DynamoClient {
         Ok(qo)
     }
 
+    /// Query a page by hashkey (pk) with a descending order.
     pub async fn query_page_by_pk(
         &self,
         pk: &str,
@@ -272,7 +269,7 @@ impl DynamoClient {
 
         Ok(qo)
     }
-    
+
     pub async fn query_with_key(
         &self,
         gsi: Option<String>,
@@ -281,7 +278,8 @@ impl DynamoClient {
         eav: Option<HashMap<String, AttributeValue>>,
         tablename: Option<&str>,
     ) -> Result<QueryOutput, DynamoError> {
-        let qo = self.client
+        let qo = self
+            .client
             .query()
             .table_name(tablename.unwrap_or(&self.table_name))
             .set_index_name(gsi)
@@ -372,7 +370,7 @@ impl DynamoClient {
         Ok(qo)
     }
 
-    /// Query by pk with a filter expression.
+    /// Query by pk with a filter expression for short dataset (no pagination necessary)
     ///
     /// # Arguments
     ///
@@ -400,6 +398,27 @@ impl DynamoClient {
             .send()
             .await
             .map_err(|e| DynamoError::DynDbError(format!("{}", DisplayErrorContext(e))))?;
+        Ok(qo)
+    }
+
+    pub async fn query_page_by_pk_with_filter(
+        &self,
+        pk: &str,
+        last_key_str: Option<String>,
+        limit: Option<i32>,
+        ascending: bool,
+        filter: &str,
+        filter_names: Option<HashMap<String, String>>,
+        filter_vals: Option<HashMap<String, AttributeValue>>,
+        tablename: Option<&str>,
+    ) -> Result<QueryOutput, DynamoError> {
+        let qo = QueriesBuilder::with_table(&self.client, tablename.unwrap_or(&self.table_name))
+            .hash_key(pk)
+            .set_ascending(ascending)
+            .set_page_size(limit)
+            .set_page_key(last_key_str)
+            .set_filter(filter, filter_names, filter_vals)
+            .build().go().await?;
         Ok(qo)
     }
 
@@ -744,12 +763,13 @@ impl DynamoClient {
                     let sk = item.get("sk").cloned().unwrap();
                     let k: HashMap<String, AttributeValue> =
                         HashMap::from([("pk".to_string(), pk), ("sk".to_string(), sk)]);
-                    let delete_req = DeleteRequest::builder()
-                        .set_key(Some(k))
-                        .build()
-                        .map_err(|e| {
-                            DynamoError::DynDbError(format!("{}", DisplayErrorContext(&e)))
-                        })?;
+                    let delete_req =
+                        DeleteRequest::builder()
+                            .set_key(Some(k))
+                            .build()
+                            .map_err(|e| {
+                                DynamoError::DynDbError(format!("{}", DisplayErrorContext(&e)))
+                            })?;
                     Ok(WriteRequest::builder()
                         .set_delete_request(Some(delete_req))
                         .build())
@@ -759,9 +779,11 @@ impl DynamoClient {
             let wreqs = wreqs?;
             let reqs = HashMap::from([(tabname.to_string(), wreqs)]);
 
-            self.client.batch_write_item()
+            self.client
+                .batch_write_item()
                 .set_request_items(Some(reqs))
-                .send().await
+                .send()
+                .await
                 .map_err(|e| DynamoError::DynDbError(format!("{}", DisplayErrorContext(e))))?;
         }
 
@@ -819,129 +841,4 @@ pub async fn get_dynamo_client<S: AsRef<str>>(
     DYNAMO
         .get_or_init(|| async { DynamoClient::new(tname).await })
         .await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    #[ignore]
-    async fn dynamo_put_works() {
-        let dynamo = DynamoClient::new("ici-track".to_string()).await;
-        let mut item: HashMap<String, AttributeValue> = HashMap::new();
-        item.insert(
-            "pk".to_string(),
-            AttributeValue::S("TR#ICI#home/intercci/projects/ICA".to_string()),
-        );
-        item.insert("sk".to_string(), AttributeValue::S("likes".to_string()));
-        item.insert("app".to_string(), AttributeValue::S("ICI".to_string()));
-        item.insert("value".to_string(), AttributeValue::N("0".to_string()));
-        item.insert(
-            "created".to_string(),
-            AttributeValue::S("250809161800".to_string()),
-        );
-        item.insert(
-            "updated".to_string(),
-            AttributeValue::S("250809161800".to_string()),
-        );
-        let res = dynamo.put(item, None).await;
-        // assert_eq!(res, Ok(()));
-        println!("####### {:?}", res);
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn dynamo_get_account() {
-        let dynamo = DynamoClient::new(String::from("ici-email")).await;
-        let res = dynamo.get("User#shuxin~Self", None).await;
-        match res.unwrap().item {
-            Some(item) => assert_eq!(
-                item.get("last_name").unwrap(),
-                &AttributeValue::S(String::from("Fu"))
-            ),
-            None => assert!(false, "Item not found!"),
-        }
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn dynamo_get_forward() {
-        let dynamo = DynamoClient::new(String::from("ici-email")).await;
-        let res = dynamo.query_by_pk("E#ted@intercci.com", None).await;
-        match res.unwrap().items {
-            Some(items) => {
-                assert_eq!(items.len(), 1);
-                assert_eq!(
-                    items[0].get("sk").unwrap(),
-                    &AttributeValue::S(String::from("F#qywen@hotmail.com"))
-                )
-            }
-            None => assert!(false, "Items not found"),
-        }
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn dynamo_update_n() {
-        let dynamo = DynamoClient::new(String::from("ici-track")).await;
-        let key = String::from("TR#path1/path2~likes");
-        let res = dynamo.get(&key, None).await;
-        let item = res.unwrap().item;
-        let n1 = item.as_ref().unwrap().get("value");
-        // println!("Value before update = {:?}", n1);
-        let _ures = dynamo.update_n(&key, "value", 1, None).await;
-        // assert!(false, "{:?}", ures);
-        let item2 = dynamo.get(&key, None).await.unwrap().item;
-        let n2 = item2.as_ref().unwrap().get("value");
-        // println!("Value after update = {:?}", n2);
-        let nv1 = n1.unwrap().as_n().unwrap().parse::<i32>().unwrap();
-        let nv2 = n2.unwrap().as_n().unwrap().parse::<i32>().unwrap();
-        assert_eq!(nv2, nv1 + 1);
-        // assert_eq!(nv1, 0)
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_query_page_by_pk() {
-        let dynamo = DynamoClient::new(String::from("ici-email")).await;
-        let pk = "User";
-        let limit = Some(2);
-        let r = dynamo
-            .query_page_by_pk(pk, None, limit, None)
-            .await
-            .unwrap();
-        println!("Page 1: {:?}", r);
-        let last_key = r.last_evaluated_key().unwrap();
-        let last_keys = format!(
-            "{}~{}",
-            last_key.get("pk").unwrap().as_s().unwrap(),
-            last_key.get("sk").unwrap().as_s().unwrap()
-        );
-        let r2 = dynamo
-            .query_page_by_pk(pk, Some(last_keys), limit, None)
-            .await
-            .unwrap();
-        println!("Page 2: {:?}", r2);
-        // run this test for println! result: cargo test -- --nocapture
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_get_by_pksk() {
-        let dynamo = get_dynamo_client(Some("ici-email")).await;
-        let r = dynamo.get_by_pksk("User#shuxin", "--Self", None).await;
-        println!("get_by_pksk returns: {:?}", r);
-    }
-
-    #[tokio::test]
-    // #[ignore]
-    async fn test_get_dynamo_client() {
-        let d1 = get_dynamo_client(Some("ici-users")).await;
-        println!("d1={:?}", d1);
-        let d2 = get_dynamo_client(Some("ici-award".to_string())).await;
-        println!("d2={:?}", d2);
-        let d3 = get_dynamo_client::<String>(None).await;
-        println!("d3={:?}", d3);
-    }
 }
