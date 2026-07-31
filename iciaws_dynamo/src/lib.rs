@@ -17,9 +17,9 @@ use chrono::Utc;
 use ckey::CompositeKey;
 pub mod types;
 use types::{FilterType, ItemType, StringMap};
-pub mod queries;
 pub mod builder;
 pub mod pagekey;
+pub mod queries;
 use pagekey::make_start_key;
 pub mod errors;
 use errors::DynamoError;
@@ -401,6 +401,48 @@ impl DynamoClient {
         Ok(qo)
     }
 
+    pub async fn query_page_by_pk_with_sk_expr(
+        &self,
+        pk: &str,
+        last_key_str: Option<String>,
+        limit: Option<i32>,
+        ascending: bool,
+        sk_op: &str,
+        sk_val: &str,
+        tablename: Option<&str>,
+    ) -> Result<QueryOutput, DynamoError> {
+        let qo = QueriesBuilder::with_table(&self.client, tablename.unwrap_or(&self.table_name))
+            .hash_key_with_sort_key_expr(pk, sk_op, sk_val)
+            .set_ascending(ascending)
+            .set_page_size(limit)
+            .set_page_key(last_key_str)
+            .build()
+            .go()
+            .await?;
+        Ok(qo)
+    }
+
+    pub async fn query_page_by_pk_with_sk_between(
+        &self,
+        pk: &str,
+        last_key_str: Option<String>,
+        limit: Option<i32>,
+        ascending: bool,
+        sk_val1: &str,
+        sk_val2: &str,
+        tablename: Option<&str>,
+    ) -> Result<QueryOutput, DynamoError> {
+        let qo = QueriesBuilder::with_table(&self.client, tablename.unwrap_or(&self.table_name))
+            .hash_key_with_sort_key_between(pk, sk_val1, sk_val2)
+            .set_ascending(ascending)
+            .set_page_size(limit)
+            .set_page_key(last_key_str)
+            .build()
+            .go()
+            .await?;
+        Ok(qo)
+    }
+
     pub async fn query_page_by_pk_with_filter(
         &self,
         pk: &str,
@@ -418,7 +460,9 @@ impl DynamoClient {
             .set_page_size(limit)
             .set_page_key(last_key_str)
             .set_filter(filter, filter_names, filter_vals)
-            .build().go().await?;
+            .build()
+            .go()
+            .await?;
         Ok(qo)
     }
 

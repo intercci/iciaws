@@ -54,6 +54,7 @@ impl<'a> QueriesBuilder<'a> {
         self
     }
 
+    /// Key condition with sort key as begins_with(sk, "...")
     pub fn hash_key_with_sort_key_prefix(
         mut self,
         hash_key_value: &str,
@@ -66,6 +67,42 @@ impl<'a> QueriesBuilder<'a> {
             .expression_attribute_values(":pk", AttributeValue::S(hash_key_value.into()))
             .expression_attribute_names("#sk", self.sk_name)
             .expression_attribute_values(":pfx", AttributeValue::S(sort_key_prefix.into()));
+        self
+    }
+
+    /// Key condition such as: pk = 'A' and sk > '100'
+    /// sort_key_op can be: =, >, <, >=, <=
+    pub fn hash_key_with_sort_key_expr(
+        mut self,
+        hash_key_value: &str,
+        sort_key_op: &str,
+        sort_key_val: &str,
+    ) -> Self {
+        self.builder = self
+            .builder
+            .key_condition_expression(format!("#pk = :pk and #sk {sort_key_op} :sk"))
+            .expression_attribute_names("#pk", self.pk_name)
+            .expression_attribute_values(":pk", AttributeValue::S(hash_key_value.into()))
+            .expression_attribute_names("#sk", self.sk_name)
+            .expression_attribute_values(":sk", AttributeValue::S(sort_key_val.into()));
+        self
+    }
+
+    /// Key condition such as: pk = 'A' and sk between '1' and '2'
+    pub fn hash_key_with_sort_key_between(
+        mut self,
+        hash_key_value: &str,
+        sort_key_val1: &str,
+        sort_key_val2: &str,
+    ) -> Self {
+        self.builder = self
+            .builder
+            .key_condition_expression("#pk = :pk and #sk between :sk1 and :sk2")
+            .expression_attribute_names("#pk", self.pk_name)
+            .expression_attribute_values(":pk", AttributeValue::S(hash_key_value.into()))
+            .expression_attribute_names("#sk", self.sk_name)
+            .expression_attribute_values(":sk1", AttributeValue::S(sort_key_val1.into()))
+            .expression_attribute_values(":sk2", AttributeValue::S(sort_key_val2.into()));
         self
     }
 
@@ -194,6 +231,31 @@ mod test {
         assert!(dbg.contains("begins_with(#sk, :pfx)"), "{dbg}");
         assert!(dbg.contains("\"#sk\": \"sk\""), "{dbg}");
         assert!(dbg.contains("\":pfx\": S(\"F#\")"), "{dbg}");
+    }
+
+    #[test]
+    fn test_hash_key_with_sort_key_expr() {
+        let qb = QueriesBuilder::with_table(&test_client(), "test-table")
+            .hash_key_with_sort_key_expr("P#1", ">=", "1234");
+        let dbg = format!("{:?}", qb.builder);
+        assert!(
+            dbg.contains("key_condition_expression: Some(\"#pk = :pk and #sk >= :sk\")"), "{dbg}");
+        assert!(dbg.contains("\"#pk\": \"pk\""), "{dbg}");
+        assert!(dbg.contains("\"#sk\": \"sk\""), "{dbg}");
+        assert!(dbg.contains("\":sk\": S(\"1234\")"), "{dbg}");
+    }
+
+    #[test]
+    fn test_hash_key_with_sort_key_between() {
+        let qb = QueriesBuilder::with_table(&test_client(), "test-table")
+            .hash_key_with_sort_key_between("P#1", "A1", "A4");
+        let dbg = format!("{:?}", qb.builder);
+        assert!(
+            dbg.contains("key_condition_expression: Some(\"#pk = :pk and #sk between :sk1 and :sk2\")"), "{dbg}");
+        assert!(dbg.contains("\"#pk\": \"pk\""), "{dbg}");
+        assert!(dbg.contains("\"#sk\": \"sk\""), "{dbg}");
+        assert!(dbg.contains("\":sk1\": S(\"A1\")"), "{dbg}");
+        assert!(dbg.contains("\":sk2\": S(\"A4\")"), "{dbg}");
     }
 
     #[test]

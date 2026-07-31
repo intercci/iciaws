@@ -303,3 +303,136 @@ async fn dynamo_query_page_by_pk_with_filter() {
         .unwrap();
     assert_eq!(r3.count, 1, "{:?}", r3);
 }
+
+// ============================================================================
+// Live integration tests for query_page_by_pk_with_sk_expr and
+// query_page_by_pk_with_sk_between. Each test is self-contained: reset
+// (delete_by_pk) -> put_over fixtures -> query -> assert -> cleanup. Both use
+// the ici-track table and distinct pk prefixes so they can run in parallel
+// without colliding. The sk fixtures are zero-padded numeric strings so that
+// DynamoDB's lexicographic string ordering matches numeric ordering.
+// ============================================================================
+
+#[tokio::test]
+async fn dynamo_query_page_by_pk_with_sk_expr() {
+    let dynamo = DynamoClient::new(String::from("ici-track")).await;
+    let pk = "TST#q_skexpr";
+    let _ = dynamo.delete_by_pk(pk, None).await; // idempotent reset
+
+    for sk in ["1000", "2000", "3000", "4000"] {
+        dynamo
+            .put_over(
+                HashMap::from([
+                    ("pk".to_string(), AttributeValue::S(pk.to_string())),
+                    ("sk".to_string(), AttributeValue::S(sk.to_string())),
+                    ("value".to_string(), AttributeValue::N(sk.into())),
+                ]),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    // sk > 1000, descending, page size 2 -> first page holds the two largest sk.
+    let r = dynamo
+        .query_page_by_pk_with_sk_expr(pk, None, Some(2), false, ">", "1000", None)
+        .await
+        .unwrap();
+    assert_eq!(r.count, 2, "{:?}", r);
+    let items = r.items.as_ref().expect("items on page 1");
+    assert_eq!(items[0].get("sk").unwrap(), &AttributeValue::S(String::from("4000")));
+    assert_eq!(items[1].get("sk").unwrap(), &AttributeValue::S(String::from("3000")));
+    let last_k = r.last_evaluated_key().map_or(None, |k| Some(k.clone()));
+    assert!(last_k.is_some(), "last_evaluated_key is None");
+    let last_keys = last_evaluated_key_to_base64(last_k.unwrap()).expect("last_key error");
+
+    // Page 2 continues after the last key of page 1 -> remaining item "2000".
+    let r2 = dynamo
+        .query_page_by_pk_with_sk_expr(pk, Some(last_keys), None, false, ">", "1000", None)
+        .await
+        .unwrap();
+    assert_eq!(r2.count, 1, "{:?}", r2);
+    let items2 = r2.items.as_ref().expect("items on page 2");
+    assert_eq!(items2[0].get("sk").unwrap(), &AttributeValue::S(String::from("2000")));
+    assert!(r2.last_evaluated_key.is_none(), "{:?}", r2);
+
+    // Same key condition, ascending -> smallest qualifying sk first.
+    let r3 = dynamo
+        .query_page_by_pk_with_sk_expr(pk, None, None, true, ">", "1000", None)
+        .await
+        .unwrap();
+    assert_eq!(r3.count, 3, "{:?}", r3);
+    let items3 = r3.items.expect("items ascending");
+    assert_eq!(items3[0].get("sk").unwrap(), &AttributeValue::S(String::from("2000")));
+    assert_eq!(items3[1].get("sk").unwrap(), &AttributeValue::S(String::from("3000")));
+    assert_eq!(items3[2].get("sk").unwrap(), &AttributeValue::S(String::from("4000")));
+
+    // A different operator: sk < 3000, descending -> ["2000", "1000"].
+    let r4 = dynamo
+        .query_page_by_pk_with_sk_expr(pk, None, None, false, "<", "3000", None)
+        .await
+        .unwrap();
+    assert_eq!(r4.count, 2, "{:?}", r4);
+    let items4 = r4.items.expect("items for sk < 3000");
+    assert_eq!(items4[0].get("sk").unwrap(), &AttributeValue::S(String::from("2000")));
+    assert_eq!(items4[1].get("sk").unwrap(), &AttributeValue::S(String::from("1000")));
+
+    let _ = dynamo.delete_by_pk(pk, None).await; // cleanup
+}
+
+#[tokio::test]
+async fn dynamo_query_page_by_pk_with_sk_between() {
+    let dynamo = DynamoClient::new(String::from("ici-track")).await;
+    let pk = "TST#q_skbetween";
+    let _ = dynamo.delete_by_pk(pk, None).await; // idempotent reset
+
+    for sk in ["1000", "2000", "3000", "4000"] {
+        dynamo
+            .put_over(
+                HashMap::from([
+                    ("pk".to_string(), AttributeValue::S(pk.to_string())),
+                    ("sk".to_string(), AttributeValue::S(sk.to_string())),
+                    ("value".to_string(), AttributeValue::N(sk.into())),
+                ]),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    // sk between 2000 and 4000 (inclusive), descending, page size 2 -> page 1
+    // holds the two largest sk, page 2 the remaining one.
+    let r = dynamo
+        .query_page_by_pk_with_sk_between(pk, None, Some(2), false, "2000", "4000", None)
+        .await
+        .unwrap();
+    assert_eq!(r.count, 2, "{:?}", r);
+    let items = r.items.as_ref().expect("items on page 1");
+    assert_eq!(items[0].get("sk").unwrap(), &AttributeValue::S(String::from("4000")));
+    assert_eq!(items[1].get("sk").unwrap(), &AttributeValue::S(String::from("3000")));
+    let last_k = r.last_evaluated_key().map_or(None, |k| Some(k.clone()));
+    assert!(last_k.is_some(), "last_evaluated_key is None");
+    let last_keys = last_evaluated_key_to_base64(last_k.unwrap()).expect("last_key error");
+
+    let r2 = dynamo
+        .query_page_by_pk_with_sk_between(pk, Some(last_keys), None, false, "2000", "4000", None)
+        .await
+        .unwrap();
+    assert_eq!(r2.count, 1, "{:?}", r2);
+    let items2 = r2.items.as_ref().expect("items on page 2");
+    assert_eq!(items2[0].get("sk").unwrap(), &AttributeValue::S(String::from("2000")));
+    assert!(r2.last_evaluated_key.is_none(), "{:?}", r2);
+
+    // Ascending: between bounds are inclusive and returned in ascending order.
+    let r3 = dynamo
+        .query_page_by_pk_with_sk_between(pk, None, None, true, "2000", "4000", None)
+        .await
+        .unwrap();
+    assert_eq!(r3.count, 3, "{:?}", r3);
+    let items3 = r3.items.expect("items ascending");
+    assert_eq!(items3[0].get("sk").unwrap(), &AttributeValue::S(String::from("2000")));
+    assert_eq!(items3[1].get("sk").unwrap(), &AttributeValue::S(String::from("3000")));
+    assert_eq!(items3[2].get("sk").unwrap(), &AttributeValue::S(String::from("4000")));
+
+    let _ = dynamo.delete_by_pk(pk, None).await; // cleanup
+}
