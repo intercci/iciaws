@@ -1,0 +1,780 @@
+# iciaws — AI Agent Guide
+
+This repo contains a collection of independent Rust crates for building **AWS serverless backends** with Lambda, DynamoDB, S3, SES, SNS, and API Gateway. All crates use Rust 2024 edition and `tokio` for async.
+
+**Git URL**: `https://github.com/intercci/iciaws`
+**Add any crate from**: `cargo add iciaws_<name> --git https://github.com/intercci/iciaws --package iciaws_<name>`
+
+---
+
+## Quick Dependency Map
+
+| Crate | Purpose | Key Types |
+|-------|---------|-----------|
+| `iciaws_router` | HTTP router for Lambda behind API Gateway | `Router`, `AddonHolder`, `RouteHandlerInput`, `RouteHandlerOutput` |
+| `iciaws_macros` | `#[route]` and `#[derive(TransDynamo)]` proc macros | — |
+| `iciaws_dynamo` | DynamoDB client with composite keys & pagination | `DynamoClient`, `Updates` builder, `QueriesBuilder` |
+| `iciaws_s3` | S3 client with presigned URLs | `S3Client` |
+| `iciaws_ses` | SES v2 email client | `SesClient` |
+| `iciaws_sns` | SNS pub/sub client | `SnsClient` |
+| `iciaws_test_helper` | Test utilities (integration tests only) | `create_router`, `call_router`, `create_get`/`create_post` |
+
+---
+
+## iciaws_router — HTTP Router for Lambda
+
+### Setup (main.rs)
+
+```rust
+use iciaws_router::{addons::AddonHolder, router::Router};
+use lambda_http::{Body, Error, Request, Response, run, service_fn, tracing};
+use iciaws_dynamo::get_dynamo_client;
+use iciaws_s3::get_s3_client;
+use iciaws_ses::get_ses_client;
+use iciaws_sns::get_sns_client;
+use my_app::routes::add_routes;
+
+async fn function_handler(event: Request, router: &Router) -> Result<Response<Body>, Error> {
+    let resp: Response<Body> = router.route(event).await.try_into()?;
+    Ok(resp)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    tracing::init_default_subscriber();
+
+    let addons = AddonHolder::new();
+    addons.put_addon("dynamo", get_dynamo_client(Some("my-table")).await);
+    addons.put_addon("s3", get_s3_client().await);
+    addons.put_addon("ses", get_ses_client().await);
+    addons.put_addon("sns", get_sns_client().await);
+
+    let mut router = Router::new(addons);
+    add_routes(&mut router);
+
+    let router = &router;
+    run(service_fn(move |event| async move {
+        function_handler(event, router).await
+    }))
+    .await
+}
+```
+
+### Adding a Route
+
+1. Create a handler function in `src/handlers/<module>.rs` using `#[route("METHOD/path")]`
+2. The `#[route]` macro (from `iciaws_macros`) generates a handler struct named `XxxHandler` with a `get_key()` method
+3. Register in `src/routes.rs`:
+
+```rust
+use iciaws_router::router::Router;
+use crate::handlers::users::{GetUserHandler, QueryUsersHandler};
+
+pub fn add_routes(router: &mut Router) {
+    router.add_route(GetUserHandler::get_key(), Box::new(GetUserHandler));
+    router.add_route(QueryUsersHandler::get_key(), Box::new(QueryUsersHandler));
+}
+```
+
+### Handler Signature
+
+```rust
+use iciaws_router::{
+    addons::AddonHolder,
+    input::RouteHandlerInput,
+    output::RouteHandlerOutput,
+};
+use iciaws_macros::route;
+use iciaws_dynamo::DynamoClient;
+use anyhow::Result;
+use http::StatusCode;
+
+#[route("GET/users/{uid}")]
+pub async fn get_user(
+    input: RouteHandlerInput,
+    addons: &AddonHolder,
+) -> Result<RouteHandlerOutput> {
+    let uid = input.get_path_value("uid")?;
+    let dynamo = addons.get::<&DynamoClient>("dynamo")?;
+    // ... business logic
+    Ok(RouteHandlerOutput::message_output(StatusCode::OK, "found"))
+}
+```
+
+### RouteHandlerInput API
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `input.get_path_value("key")?` | `Result<String>` | Path parameter (required) |
+| `input.get_query_value("key")?` | `Result<String>` | Query string parameter (required) |
+| `input.get_claim("uid")?` | `Result<String>` | Auth claim from JWT/authorizer (required) |
+| `input.get_body_prop_as_str("field")` | `Option<&str>` | Optional body field |
+| `input.get_required_body_prop_as_str("field")?` | `Result<&str>` | Required body field as str |
+| `input.get_required_body_prop("field")?` | `Result<&Value>` | Required body field as Value |
+| `input.body` | `Option<Value>` | Parsed JSON body |
+| `input.its_my_path("uid")?` | `Result<String>` | Path param ownership check (matches auth uid) |
+| `input.am_i_a("role")` | `bool` | Role check |
+| `input.i_am_a("role")?` | `Result<()>` | Role check with error |
+
+### Response Helpers (from `iciaws_router::output`)
+
+```rust
+use iciaws_router::output::*;
+
+// Simple message response
+RouteHandlerOutput::message_output(StatusCode::OK, "done")
+
+// JSON response
+RouteHandlerOutput::json_output(StatusCode::OK, serde_json::json!({ "ok": true }))
+
+// Pre-built helpers
+ok_json(json_string)                          // 200 OK
+get_ok("user", user_obj)                      // 200 OK, wraps in {status,name,item}
+query_ok("users", vec![...])                  // 200 OK, wraps in {status,name,items}
+query_page_ok("users", vec![...], last_key)   // 200 OK with pagination
+item_created("user", "uid", "abc123")         // 201 Created
+item_updated("user")                          // 200 OK
+item_deleted("user")                          // 204 No Content
+fail_with_message("user", "not found")        // 200 OK with Fail status
+ok_with_extra("user", hashmap_of_values)      // 200 OK with extra fields
+ok_with_tokens_by_cookie(json, jwt, rtk, domain) // 200 OK with set-cookie headers
+preflight(origin)                             // CORS preflight response
+```
+
+### Error Helpers (from `iciaws_router::errors`)
+
+```rust
+use iciaws_router::errors::*;
+
+bad_request_error("message")     // 400
+not_found_error("resource")      // 404
+missing_body_field("field")      // 400 — field missing from body
+missing_parameter("key", "path") // 400 — parameter missing
+missing_token_claim("uid")       // 401 — auth claim missing
+unauthorized_error("message")    // 401 — auth failed
+```
+
+### AddonHolder — Dependency Injection
+
+```rust
+// Store
+addons.put_addon("dynamo", dynamo_client);
+addons.put_addon("s3", s3_client);
+
+// Retrieve in handler
+let dynamo = addons.get::<&DynamoClient>("dynamo")?;
+let s3 = addons.get::<&S3Client>("s3")?;
+let ses = addons.get::<&SesClient>("ses")?;
+let sns = addons.get::<&SnsClient>("sns")?;
+```
+
+---
+
+## iciaws_macros — Proc Macros
+
+### `#[route("METHOD/path")]`
+
+Decorates a handler function. Generates:
+- A struct `<Name>Handler` implementing `RouteHandler`
+- A static `static <NAME>KEY: &'static str = "METHOD/path"`
+- A `get_key()` method returning the route string
+
+```rust
+use iciaws_macros::route;
+
+#[route("GET/homes/{id}")]
+pub async fn get_homes(
+    input: RouteHandlerInput,
+    addons: &AddonHolder,
+) -> Result<RouteHandlerOutput> {
+    // handler body
+}
+// Generates: pub struct GetHomesHandler; impl RouteHandler for GetHomesHandler { ... }
+// And: GetHomesHandler::get_key() == "GET/homes/{id}"
+```
+
+### `#[derive(TransDynamo)]`
+
+Derives conversion functions between a Rust struct and DynamoDB items. Requires the struct to also implement `DefaultKeys`.
+
+```rust
+use iciaws_macros::TransDynamo;
+use iciaws_router::types::DefaultKeys;
+use serde::{Serialize, Deserialize};
+use anyhow::Result;
+
+#[derive(Debug, Serialize, Deserialize, TransDynamo)]
+pub struct User {
+    pub pk: Option<String>,
+    pub sk: Option<String>,
+    pub name: String,
+}
+
+impl DefaultKeys for User {
+    fn set_default_keys(&mut self, from_map: &serde_json::Value) -> Result<()> {
+        self.pk = Some(format!("User#{}", from_map.get("uid").and_then(|v| v.as_str()).unwrap_or("unknown")));
+        self.sk = Some("#".to_string());
+        Ok(())
+    }
+}
+```
+
+`TransDynamo` generates:
+- `pub fn users_from_dynamodb(items: Vec<HashMap<String, AttributeValue>>) -> Result<Vec<User>>` — batch deserialization
+- `impl TryFrom<serde_json::Value> for User` — JSON → struct
+- `impl TryFrom<HashMap<String, AttributeValue>> for User` — DynamoDB item → struct
+- `impl TryFrom<User> for HashMap<String, AttributeValue>` — struct → DynamoDB item
+
+### Crates Required for a TransDynamo Model
+
+A model that uses `#[derive(TransDynamo)]` must import dependencies from three crates:
+
+```toml
+[dependencies]
+# The macro crate — provides #[derive(TransDynamo)]
+iciaws_macros = { git = "https://github.com/intercci/iciaws", package = "iciaws_macros" }
+# The router crate — provides DefaultKeys trait and serde support
+iciaws_router = { git = "https://github.com/intercci/iciaws", package = "iciaws_router" }
+# DynamoDB attribute value type and serde serialization
+aws-sdk-dynamodb = "1.116.0"
+serde_dynamo = "4.3.0"
+anyhow = "1.0.102"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+```
+
+In the source file, the necessary imports are:
+
+```rust
+use iciaws_macros::TransDynamo;
+use iciaws_router::types::DefaultKeys;
+use aws_sdk_dynamodb::types::AttributeValue;
+use std::collections::HashMap;
+use serde::{Serialize, Deserialize};
+use anyhow::Result;
+```
+
+---
+
+## iciaws_dynamo — DynamoDB Client
+
+### Setup
+
+```rust
+use iciaws_dynamo::get_dynamo_client;
+
+// Static singleton — initialized once per Lambda invocation
+let dynamo = get_dynamo_client(Some("my-table")).await;
+// Or without default table (reads TABLE_NAME env var, defaults to "ici-users")
+let dynamo = get_dynamo_client(None::<String>).await;
+```
+
+### CRUD Operations
+
+```rust
+use aws_sdk_dynamodb::types::AttributeValue;
+use std::collections::HashMap;
+use iciaws_dynamo::DynamoClient;
+
+// PUT (fails if item with same pk/sk exists)
+let mut item: HashMap<String, AttributeValue> = HashMap::new();
+item.insert("pk".into(), AttributeValue::S("User#alice".into()));
+item.insert("sk".into(), AttributeValue::S("#".into()));
+dynamo.put(item, None).await?;
+
+// PUT (overwrites existing)
+dynamo.put_over(item, None).await?;
+
+// GET by pk/sk strings
+let result = dynamo.get_by_pksk("User#alice", "#", None).await?;
+let user: User = result.item.unwrap().try_into()?;
+
+// GET by composite key string ("pk~sk")
+let result = dynamo.get("User#alice~#", None).await?;
+
+// PUT + deserialize in one step (from JSON value)
+use serde_dynamo;
+let pitem: HashMap<String, AttributeValue> = serde_dynamo::to_item(my_json_value)?;
+dynamo.put_over(pitem, None).await?;
+```
+
+### Query Operations
+
+```rust
+// Query all items with a given pk (descending by sk)
+let results = dynamo.query_by_pk("User#alice", None).await?;
+
+// Query latest N items (sk is timestamp-like, descending)
+let results = dynamo.query_latest_by_pk("User#alice", Some(10), None).await?;
+
+// Query by pk with sk prefix match
+let results = dynamo.query_by_pk_with_sk_prefix("User#alice", "Post#", None).await?;
+
+// Query with pagination (base64-encoded last_evaluated_key)
+let results = dynamo.query_page_by_pk("User#alice", last_key_b64, Some(10), None).await?;
+
+// Query by pk with filter expression (no pagination — small datasets)
+let results = dynamo.query_by_pk_with_filter(
+    "User#alice",
+    "status = :status",
+    None,
+    Some(HashMap::from([(":status".into(), AttributeValue::S("active".into())]))),
+    None,
+).await?;
+```
+
+### QueriesBuilder — Fluent Query API
+
+```rust
+use iciaws_dynamo::queries::QueriesBuilder;
+use iciaws_dynamo::pagekey::last_evaluated_key_to_base64;
+
+// Simple pk query with pagination
+let qo = QueriesBuilder::with_table(&dynamo.client, "my-table")
+    .hash_key("User#alice")
+    .set_ascending(false)          // default: false (descending)
+    .set_page_size(Some(10))
+    .set_page_key(last_key)        // None for first page
+    .build()
+    .go()
+    .await?;
+
+// pk + sk prefix
+let qo = QueriesBuilder::with_table(&dynamo.client, "my-table")
+    .hash_key_with_sort_key_prefix("User#alice", "Post#")
+    .build()
+    .go()
+    .await?;
+
+// pk + sk expression (>, <, >=, <=, =)
+let qo = QueriesBuilder::with_table(&dynamo.client, "my-table")
+    .hash_key_with_sort_key_expr("User#alice", ">=", "2024")
+    .build()
+    .go()
+    .await?;
+
+// pk + sk between
+let qo = QueriesBuilder::with_table(&dynamo.client, "my-table")
+    .hash_key_with_sort_key_between("User#alice", "2024-01", "2024-12")
+    .build()
+    .go()
+    .await?;
+
+// With filter
+let qo = QueriesBuilder::with_table(&dynamo.client, "my-table")
+    .hash_key("User#alice")
+    .set_filter(
+        "contains(#name, :search)",
+        Some(HashMap::from([("#name".into(), "name".into())])),
+        Some(HashMap::from([(":search".into(), AttributeValue::S("alice".into())]))),
+    )
+    .set_page_size(Some(10))
+    .build()
+    .go()
+    .await?;
+
+// GSI query
+let qo = QueriesBuilder::with_table(&dynamo.client, "my-table")
+    .use_index("GSI1Index")
+    .key_names("gpk", "gsk")     // custom key names for GSI
+    .hash_key("App#main")
+    .build()
+    .go()
+    .await?;
+
+// Extract next page key
+let next_key = qo.last_evaluated_key
+    .map(|k| last_evaluated_key_to_base64(k).unwrap());
+```
+
+### Update Operations
+
+```rust
+// Atomic counter increment
+dynamo.update_add("User#alice~#", "count", 1, None).await?;
+
+// Update a string field
+dynamo.update_s("User#alice~#", "name", "Alice Smith", None).await?;
+
+// Update a numeric field
+dynamo.update_n("User#alice~#", "score", 100, None).await?;
+
+// Remove an attribute
+dynamo.update_remove_attr("User#alice~#", "temp_field", None).await?;
+
+// Append to a list (creates list if not exists)
+let key: HashMap<String, AttributeValue> = HashMap::from([
+    ("pk".into(), AttributeValue::S("User#alice".into())),
+    ("sk".into(), AttributeValue::S("#".into())),
+]);
+dynamo.update_add_list_str(key, "tags", "rust").await?;
+dynamo.update_add_list(key, "tags", serde_json::json!({"k":"v"})).await?;
+
+// Full update with Updates builder
+use iciaws_dynamo::builder::Updates;
+
+let updates = Updates::builder()
+    .set_pksk(Some("User#alice"), Some("#"))
+    .set("name", &serde_json::json!("Alice"))
+    .set("age", &serde_json::json!(30))
+    .remove("temp_field")
+    .append("tags", &serde_json::json!("new_tag"))
+    .add("score", &serde_json::json!(1))
+    .build()?;
+
+dynamo.update(updates.key, updates.uex(), updates.ean, updates.eav, None).await?;
+```
+
+### Delete Operations
+
+```rust
+// Delete by pk/sk strings
+dynamo.delete_by_pksk("User#alice", "#", None).await?;
+
+// Delete by composite key string with condition
+dynamo.delete("User#alice~#", "attribute_not_exists(deleted)", None).await?;
+
+// Batch delete (auto-chunked to 25)
+dynamo.batch_delete(vec![item1, item2, ...], "my-table").await?;
+
+// Delete all items sharing a pk
+dynamo.delete_by_pk("User#alice", None).await?;
+```
+
+### Composite Keys
+
+Keys use `~` as separator: `"pk~sk"`. The `CompositeKey` type handles parsing and formatting.
+
+```rust
+use iciaws_dynamo::ckey::CompositeKey;
+
+// From string
+let ck: CompositeKey = "User#alice~Profile".into();
+assert_eq!(ck.pk(), "User#alice");
+assert_eq!(ck.sk(), "Profile");
+
+// To key hashmap
+let hm: HashMap<String, AttributeValue> = ck.into();
+// { "pk": S("User#alice"), "sk": S("Profile") }
+
+// Key condition expression (auto-detects prefix queries)
+let ck_prefix = CompositeKey::new("User#alice", "Post#*");
+assert_eq!(ck_prefix.key_condition_expression(), "pk = :hashKey AND begins_with( sk, :rangeKey )");
+```
+
+### Pagination Keys
+
+```rust
+use iciaws_dynamo::pagekey::{last_evaluated_key_to_base64, make_start_key};
+
+// Convert DynamoDB key to base64 for URL parameter
+let b64 = last_evaluated_key_to_base64(last_evaluated_key)?;
+
+// Convert back for next query
+let start_key = make_start_key(Some(b64_string)); // returns Option<HashMap<String, AttributeValue>>
+```
+
+---
+
+## iciaws_s3 — S3 Client
+
+```rust
+use iciaws_s3::get_s3_client;
+
+let s3 = get_s3_client().await; // static singleton
+
+// Get object as bytes / string / JSON
+let bytes = s3.get_bytes("path/to/file.bin", None).await?;
+let text = s3.get_string("config/app.json", None).await?;
+let json: serde_json::Value = s3.get_json("config/app.json", None).await?;
+
+// Put object
+use aws_sdk_s3::primitives::ByteStream;
+let stream = ByteStream::from(bytes);
+s3.put_object("uploads/report.pdf", stream, None).await?;
+
+// Presigned URLs
+let download_url = s3.get_presign("photos/vacation.jpg", None).await?;  // 60s default
+let upload_url = s3.put_presign("photos/vacation.jpg", None).await?;    // 5min default
+
+// List images under a folder (filters .jpg, .jpeg, .png, .gif, .webp)
+let images = s3.list_images("photos/vacation", None).await?;
+
+// Bucket: reads BUCKET env var, defaults to "ici-uploads"
+```
+
+---
+
+## iciaws_ses — SES Email Client
+
+```rust
+use iciaws_ses::get_ses_client;
+
+let ses = get_ses_client().await; // static singleton
+
+// Send raw email (full MIME content)
+let msg_id = ses.send_raw("from@example.com", vec!["to@example.com"], raw_mime_content).await?;
+
+// Send simple HTML email
+let msg_id = ses.send_simple(
+    "from@example.com",
+    "Subject line",
+    vec!["to@example.com"],
+    Some(vec!["cc@example.com"]),  // optional CC
+    Some(vec!["bcc@example.com"]), // optional BCC
+    "<h1>Hello</h1>",
+).await?;
+
+// Send template email
+let msg_id = ses.send_template(
+    "WelcomeTemplate",
+    serde_json::to_string(&serde_json::json!({"name": "Alice"})).unwrap(),
+    "from@example.com",
+    vec!["to@example.com"],
+).await?;
+
+// Bulk email with stored template
+use iciaws_ses::BulkUserData;
+let users = vec![
+    BulkUserData { email: "a@example.com".into(), ds: r#"{"name":"Alice"}"#.into() },
+    BulkUserData { email: "b@example.com".into(), ds: r#"{"name":"Bob"}"#.into() },
+];
+ses.send_bulk_template("WelcomeTemplate", r#"{"greeting":"Hi"}"#.into(), users, "from@example.com").await?;
+
+// Bulk email with inline template
+ses.send_bulk_inline_template(
+    "Subject",
+    "<h1>Hello {{name}}</h1>",
+    "Hello {{name}}",
+    r#"{}"#.into(),
+    users,
+    "from@example.com",
+).await?;
+
+// Template management
+ses.list_email_templates().await?;
+ses.get_email_template("WelcomeTemplate").await?;
+ses.create_template("Name", "Subject", "<html>", "text").await?;
+ses.update_template("Name", "Subject", "<html>", "text").await?;
+ses.delete_template("Name").await?;
+
+// Contact lists
+ses.list_contact_lists().await?;
+ses.get_contact_list("ListName").await?;
+ses.list_contacts("ListName").await?;
+```
+
+---
+
+## iciaws_sns — SNS Client
+
+```rust
+use iciaws_sns::get_sns_client;
+
+let sns = get_sns_client().await; // static singleton
+// Reads TOPIC_ARN from env var
+
+// Publish to topic (uses TOPIC_ARN env var by default)
+let msg_id = sns.publish("Hello world", None).await?;
+
+// Publish to specific topic
+let msg_id = sns.publish("Alert!", Some("arn:aws:sns:us-east-1:123456789:my-topic")).await?;
+```
+
+---
+
+## iciaws_test_helper — Integration Testing
+
+Add to `Cargo.toml` as `[dev-dependencies]`:
+```toml
+iciaws_test_helper = { git = "https://github.com/intercci/iciaws", package = "iciaws_test_helper" }
+serial_test = "4.0.1"
+```
+
+```rust
+use iciaws_test_helper::{call_router, create_get, create_post, create_put, create_delete, create_router, fmt_error, StatusValue};
+use my_app::routes::add_routes;
+
+#[tokio::test]
+async fn test_get_users() {
+    let mut router = create_router("ici-users").await; // uses local DynamoDB
+    add_routes(&mut router);
+
+    let req = create_get("/users");
+    let StatusValue { status, value } = call_router(&router, req).await.unwrap();
+    assert_eq!(status, http::StatusCode::OK);
+    assert_eq!(value["status"].as_str(), Some("OK"));
+}
+
+#[tokio::test]
+async fn test_create_user() {
+    let mut router = create_router("ici-users").await;
+    add_routes(&mut router);
+
+    let body = serde_json::json!({"uid": "alice", "name": "Alice", "role": "user"});
+    let req = create_post("/users", body);
+    let StatusValue { status, value } = call_router(&router, req).await.unwrap();
+    assert_eq!(status, http::StatusCode::CREATED);
+}
+
+// Custom request with auth claims
+use iciaws_test_helper::create_request;
+use http::Method;
+let req = create_request(Method::GET, "/users/1234", "1234", "admin", None);
+// uid=1234, role=admin in authorizer claims
+```
+
+---
+
+## Single-Table DynamoDB Design Patterns
+
+### Composite Key Convention
+- `pk` = partition key, `sk` = sort key
+- Format: `"<Entity>#{id}~<type>#[sub-id>"` e.g. `"User#alice~Profile"`, `"Post#abc123~Comment#xyz"`
+- Use `~` as pk/sk separator in ID strings
+
+### Common pk/sk Patterns
+```
+User#<uid>         ~  #              — User profile
+App#<appid>        ~  #              — App config
+Post#<id>          ~  #              — Post record
+Post#<id>          ~  Comment#<cid>  — Comment on post
+```
+
+### Query Patterns
+```rust
+// Query all posts for a user (descending by sk = newest first)
+dynamo.query_page_by_pk("Post#abc123", None, Some(10), None).await?;
+
+// Query with sk prefix (e.g. all comments on a post)
+dynamo.query_by_pk_with_sk_prefix("Post#abc123", "Comment#", None).await?;
+
+// Query latest item only
+dynamo.query_latest_by_pk("Post#abc123", Some(1), None).await?;
+```
+
+---
+
+## Standard Project Structure
+
+```
+src/
+├── main.rs            — Lambda entrypoint, init clients, register routes
+├── routes.rs          — Hand-maintained route registration
+├── common/
+│   ├── mod.rs
+│   └── utils.rs       — Env vars (LazyLock), timestamp helpers, key helpers
+├── models/
+│   ├── mod.rs         — Re-exports all models
+│   └── <entity>.rs    — Model struct with TransDynamo + DefaultKeys + CRUD methods
+└── handlers/
+    ├── mod.rs         — Re-exports all handler modules
+    └── <entities>.rs  — Handler functions with #[route] macro
+```
+
+### File Naming Convention
+
+| Purpose | Filename | Example |
+|---------|----------|---------|
+| Model definition | **singular** | `user.rs` defines `struct User` |
+| Handler module | **plural** | `users.rs` contains `GetUserHandler`, `QueryUsersHandler`, etc. |
+
+This convention keeps the model definition and its request handlers clearly separated: one file for the data shape, one file (plural name) for the API surface.
+
+### Adding a Model
+
+1. Create `src/models/<entity>.rs` (singular name) with a `#[derive(TransDynamo)]` struct and a `DefaultKeys` impl:
+
+```rust
+use iciaws_macros::TransDynamo;
+use iciaws_router::types::DefaultKeys;
+use serde::{Serialize, Deserialize};
+use anyhow::Result;
+
+#[derive(Debug, Clone, Serialize, Deserialize, TransDynamo)]
+pub struct User {
+    pub pk: Option<String>,
+    pub sk: Option<String>,
+    pub name: String,
+    pub email: String,
+}
+
+impl DefaultKeys for User {
+    fn set_default_keys(&mut self, from_map: &serde_json::Value) -> Result<()> {
+        self.pk = Some(format!("User#{}", from_map.get("uid").and_then(|v| v.as_str()).unwrap_or("unknown")));
+        self.sk = Some("#".to_string());
+        Ok(())
+    }
+}
+```
+
+2. Re-export from `src/models/mod.rs`:
+
+```rust
+pub mod user;
+pub use user::User;
+```
+
+### Adding a Request Handler
+
+1. Create `src/handlers/<entities>.rs` (plural name) with `#[route]`-decorated functions:
+
+```rust
+use iciaws_macros::route;
+use iciaws_router::{
+    addons::AddonHolder,
+    input::RouteHandlerInput,
+    output::RouteHandlerOutput,
+};
+use anyhow::Result;
+
+#[route("GET/users/{uid}")]
+pub async fn get_user(
+    input: RouteHandlerInput,
+    addons: &AddonHolder,
+) -> Result<RouteHandlerOutput> {
+    let uid = input.get_path_value("uid")?;
+    // ... business logic
+    Ok(RouteHandlerOutput::json_output(
+        http::StatusCode::OK,
+        serde_json::json!({ "uid": uid }),
+    ))
+}
+```
+
+2. Re-export the module from `src/handlers/mod.rs`:
+
+```rust
+pub mod users;
+```
+
+### Registering the Route
+
+3. Add the generated handler struct to `src/routes.rs`. The `#[route]` macro creates a struct named `<FnName>Handler` (PascalCase of the function name):
+
+```rust
+use iciaws_router::router::Router;
+use crate::handlers::users::{GetUserHandler, QueryUsersHandler};
+
+pub fn add_routes(router: &mut Router) {
+    router.add_route(GetUserHandler::get_key(), Box::new(GetUserHandler));
+    router.add_route(QueryUsersHandler::get_key(), Box::new(QueryUsersHandler));
+}
+```
+
+> **Note:** Always register every handler in `routes.rs`. The `#[route]` macro generates the struct but does **not** register it with the router.
+
+---
+
+## Common Pitfalls
+
+1. **Always register routes** in `src/routes.rs` — the `#[route]` macro generates the handler struct but doesn't register it
+2. **Every TransDynamo struct needs DefaultKeys** — required for `try_from(serde_json::Value)` to set pk/sk
+3. **Use `Option<String>` with `skip_serializing_if`** for optional model fields to avoid nulls in JSON
+4. **Timestamp functions have a typo**: `timextamp_long()` / `timextamp_short()` — preserve for consistency
+5. **Static singletons** (`get_dynamo_client`, `get_s3_client`, etc.) are initialized once per Lambda invocation — do not create new clients per request
+6. **DynamoDB table name**: defaults to env `TABLE_NAME` or `"ici-users"` — pass `Some("name")` to override
+7. **Composite key separator** is `~` (tilde), not `#` — `"pk~sk"` format
+8. **Pagination key** is base64url-encoded JSON — use `last_evaluated_key_to_base64()` to serialize, pass `last` query param to resume
+9. **Filename convention**: model definition files use the **singular** entity name (e.g. `user.rs`), while the handler module uses the **plural** name (e.g. `users.rs`)
+10. **TransDynamo requires importing `iciaws_macros` and `iciaws_router`** — both crates must be in dependencies for the derive macro and `DefaultKeys` trait to be available
