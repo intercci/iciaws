@@ -4,10 +4,14 @@ use aws_sdk_dynamodb::{
     Client,
     error::DisplayErrorContext,
     operation::{
-        batch_write_item::BatchWriteItemOutput, get_item::GetItemOutput, put_item::PutItemOutput,
-        query::QueryOutput, scan::ScanOutput, update_item::UpdateItemOutput,
+        batch_get_item::BatchGetItemOutput, batch_write_item::BatchWriteItemOutput,
+        get_item::GetItemOutput, put_item::PutItemOutput, query::QueryOutput, scan::ScanOutput,
+        update_item::UpdateItemOutput,
     },
-    types::{AttributeValue, DeleteRequest, PutRequest, ReturnValue, WriteRequest},
+    types::{
+        AttributeValue, DeleteRequest, KeysAndAttributes, PutRequest, ReturnValue, WriteRequest,
+        builders::KeysAndAttributesBuilder,
+    },
 };
 use dotenv::dotenv;
 use std::collections::HashMap;
@@ -25,7 +29,7 @@ pub mod errors;
 use errors::DynamoError;
 use tokio::sync::OnceCell;
 
-use crate::queries::QueriesBuilder;
+use crate::{errors::DynamoError::DynDbError, queries::QueriesBuilder};
 
 pub async fn dynamo_client() -> Client {
     if env::var("LAMBDA_TASK_ROOT").is_err() {
@@ -125,6 +129,26 @@ impl DynamoClient {
             .await
             .map_err(|e| DynamoError::DynDbError(format!("{}", DisplayErrorContext(e))))?;
 
+        Ok(bo)
+    }
+
+    pub async fn batch_get(
+        &self,
+        keys: Vec<ItemType>,
+        tablename: Option<&str>,
+    ) -> Result<BatchGetItemOutput, DynamoError> {
+        let ka = KeysAndAttributes::builder()
+            .set_keys(Some(keys))
+            .build()
+            .map_err(|e| DynDbError(format!("{}", DisplayErrorContext(e))))?;
+
+        let bo = self
+            .client
+            .batch_get_item()
+            .request_items(tablename.unwrap_or(&self.table_name).to_string(), ka)
+            .send()
+            .await
+            .map_err(|e| DynamoError::DynDbError(format!("{}", DisplayErrorContext(e))))?;
         Ok(bo)
     }
 
