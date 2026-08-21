@@ -507,6 +507,15 @@ impl DynamoClient {
         Ok(so)
     }
 
+    /// Scan with a FilterExpression especially for pk with a shared prefix, like 'User#'
+    /// 
+    /// ```rust,ignore
+    /// let filterExp = "begins_with(#pk, :pkv)";
+    /// let ean = HashMap::from([("#pk".to_owned(), "pk".to_owned())]);
+    /// let eav = HashMap::from([(":pkv".to_owned(), AttributeValue::S("User#".to_owned()))]);
+    /// let so = dynamo.scan_with_filter2(filter, ean, eav, None, None).await?;
+    /// println!("{:?}", so);
+    /// ```
     pub async fn scan_with_filter2(
         &self,
         filter_expression: &str,
@@ -821,7 +830,7 @@ impl DynamoClient {
     pub async fn batch_delete(
         &self,
         items: Vec<HashMap<String, AttributeValue>>,
-        tabname: &str,
+        tabname: Option<&str>,
     ) -> Result<(), DynamoError> {
         for chunk in items.chunks(25) {
             let wreqs: Result<Vec<WriteRequest>, DynamoError> = chunk
@@ -845,7 +854,8 @@ impl DynamoClient {
                 .collect();
 
             let wreqs = wreqs?;
-            let reqs = HashMap::from([(tabname.to_string(), wreqs)]);
+            let tname = tabname.unwrap_or(&self.table_name);
+            let reqs = HashMap::from([(tname.to_string(), wreqs)]);
 
             self.client
                 .batch_write_item()
@@ -879,7 +889,7 @@ impl DynamoClient {
         if let Some(items) = qo.items
             && !items.is_empty()
         {
-            let _bdo = self.batch_delete(items, tabname).await?;
+            let _bdo = self.batch_delete(items, Some(tabname)).await?;
         }
 
         Ok(())
