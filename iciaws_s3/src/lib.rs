@@ -205,6 +205,22 @@ impl S3Client {
             .collect();
         Ok(imgs)
     }
+
+    pub async fn delete_object(
+        &self,
+        object: impl Into<String>,
+        bucket: Option<&str>,
+    ) -> Result<(), S3Error> {
+        let _o = self
+            .client
+            .delete_object()
+            .bucket(bucket.unwrap_or(&self.default_bucket))
+            .key(object)
+            .send()
+            .await
+            .map_err(|e| S3Error::GetObject(format!("{}", DisplayErrorContext(e))))?;
+        Ok(())
+    }
 }
 
 pub static S3: OnceCell<S3Client> = OnceCell::const_new();
