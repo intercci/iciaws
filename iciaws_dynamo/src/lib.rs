@@ -248,6 +248,26 @@ impl DynamoClient {
             .map_err(|e| DynamoError::DynDbError(format!("{}", DisplayErrorContext(e))))?;
         Ok(qo)
     }
+    pub async fn query_page_by_pk_with_sk_prefix(
+        &self,
+        pk: &str,
+        sk_prefix: &str,
+        last_key_str: Option<String>,
+        limit: Option<i32>,
+        tablename: Option<&str>,
+    ) -> Result<QueryOutput, DynamoError> {
+        let qo = self.client.query().table_name(tablename.unwrap_or(&self.table_name))
+            .key_condition_expression("pk = :hashKey and begins_with(sk, :prefix)")
+            .expression_attribute_values(":hashKey", AttributeValue::S(pk.to_string()))
+            .expression_attribute_values(":prefix", AttributeValue::S(sk_prefix.to_string()))
+            .set_limit(limit)
+            .set_exclusive_start_key(make_start_key(last_key_str))
+            .scan_index_forward(false)
+            .send()
+            .await
+            .map_err(|e| DynamoError::DynDbError(format!("{}", DisplayErrorContext(e))))?;
+        Ok(qo)
+    }
 
     /// Query a page by hashkey (pk) with a descending order.
     pub async fn query_page_by_pk(
