@@ -516,6 +516,32 @@ impl DynamoClient {
         Ok(qo)
     }
 
+    pub async fn query_gsi_page_by_pk_with_sk_between(
+        &self,
+        gsi: &str,
+        pk_name: &str,
+        pk_val: &str,
+        sk_name: &str,
+        sk_val1: &str,
+        sk_val2: &str,
+        last_key_str: Option<String>,
+        limit: Option<i32>,
+        ascending: bool,
+        tablename: Option<&str>,
+    ) -> Result<QueryOutput, DynamoError> {
+        let qo = QueriesBuilder::with_table(&self.client, tablename.unwrap_or(&self.table_name))
+            .use_index(gsi)
+            .key_names(pk_name, sk_name)
+            .hash_key_with_sort_key_between(pk_val, sk_val1, sk_val2)
+            .set_ascending(ascending)
+            .set_page_size(limit)
+            .set_page_key(last_key_str)
+            .build()
+            .go()
+            .await?;
+        Ok(qo)
+    }
+
     pub async fn query_page_by_pk_with_filter(
         &self,
         pk: &str,
