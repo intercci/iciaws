@@ -360,6 +360,35 @@ impl DynamoClient {
         Ok(qo)
     }
 
+    pub async fn query_gsi_by_pksk(
+        &self,
+        gsi: &str,
+        pk_name: &str,
+        pk_val: &str,
+        sk_name: &str,
+        sk_val: &str,
+        forward: bool,
+        tablename: Option<&str>,
+    ) -> Result<QueryOutput, DynamoError> {
+        let qo = self
+            .client
+            .query()
+            .table_name(tablename.unwrap_or(&self.table_name))
+            .index_name(gsi)
+            .key_condition_expression("#pk = :pk")
+            .key_condition_expression("#sk = :sk")
+            .expression_attribute_names("#pk", pk_name)
+            .expression_attribute_names("#sk", sk_name)
+            .expression_attribute_values(":pk", AttributeValue::S(pk_val.to_string()))
+            .expression_attribute_values(":sk", AttributeValue::S(sk_val.to_string()))
+            .scan_index_forward(forward)
+            .send()
+            .await
+            .map_err(|e| DynamoError::DynDbError(format!("{}", DisplayErrorContext(e))))?;
+
+        Ok(qo)
+    }
+
     pub async fn query_gsi_by_pk_with_sk_prefix(
         &self,
         gsi: &str,
