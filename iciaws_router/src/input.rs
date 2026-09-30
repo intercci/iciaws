@@ -12,7 +12,13 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-static PASETO_KEYS: LazyLock<Keys> = LazyLock::new(|| Keys::from_env().unwrap());
+/// Key material used to verify PASETO tokens.
+///
+/// `PUB_KEY` is required; `PRV_KEY` is optional, so a verify-only deployment
+/// (the normal case for this crate) boots with the public key alone.
+static PASETO_KEYS: LazyLock<Keys> = LazyLock::new(|| {
+    Keys::from_env().expect("PUB_KEY must be set in the environment (PRV_KEY is optional)")
+});
 
 #[derive(Debug, Default)]
 pub struct RouteHandlerInput {
