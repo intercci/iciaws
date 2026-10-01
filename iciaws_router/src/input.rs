@@ -3,22 +3,41 @@ use super::errors::{
     RouterError, bad_request_error, missing_body_field, missing_parameter, missing_path_param,
     missing_token_claim, unauthorized_error,
 };
-use super::tokens::Keys;
+use super::verifier::Verifier;
 use aws_lambda_events::query_map::QueryMap;
 use lambda_http::request::RequestContext;
 use lambda_http::{Body, Request, RequestExt, tracing};
 use pasetors::claims::Claims;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use tokio::sync::OnceCell;
 
-/// Key material used to verify PASETO tokens.
+/// The process-wide PASETO verifier, built once on first use.
 ///
-/// `PUB_KEY` is required; `PRV_KEY` is optional, so a verify-only deployment
-/// (the normal case for this crate) boots with the public key alone.
-static PASETO_KEYS: LazyLock<Keys> = LazyLock::new(|| {
-    Keys::from_env().expect("PUB_KEY must be set in the environment (PRV_KEY is optional)")
-});
+/// `tokio::sync::OnceCell` rather than `LazyLock` because building a verifier is
+/// `async` when the key comes from AWS KMS. `const_new` lets this be a `static`
+/// with no lazy-initialisation closure.
+///
+/// A cell that fails to initialise is **not** poisoned: `get_or_try_init` leaves
+/// it empty, so a later request retries rather than caching the failure for the
+/// lifetime of the process. That matters because a transient KMS/credential
+/// failure should not permanently disable token verification in this instance.
+static PASETO_VERIFIER: OnceCell<Verifier> = OnceCell::const_new();
+
+/// Fetch the shared verifier, initialising it on first use.
+///
+/// `key_id` is `None`, so the KMS key reference comes from the `KMS_KEY_ID`
+/// environment variable — see `kms::resolve_key_id`.
+///
+/// # Errors
+///
+/// [`RouterError::KeyPairError`] when the configured key cannot be resolved or
+/// parsed — i.e. a server misconfiguration, not a caller auth failure.
+async fn paseto_verifier() -> Result<&'static Verifier, RouterError> {
+    PASETO_VERIFIER
+        .get_or_try_init(|| Verifier::new(None))
+        .await
+}
 
 #[derive(Debug, Default)]
 pub struct RouteHandlerInput {
@@ -28,16 +47,16 @@ pub struct RouteHandlerInput {
     pub claims: HashMap<String, Value>,
     pub body: Option<Value>,
     pub cookies: Option<HashMap<String, String>>, // added for rtk (refresh_token key)
-    pub localhost: Option<bool>,  // true if local debugging
+    pub localhost: Option<bool>,                  // true if local debugging
 }
 
 /// Get route_key from request context if available, else the raw_http_path
-/// 
+///
 /// route_key example: "ANY /users/{uid}"
 /// raw_http_path equivalent: "/stage/users/1234"
-/// 
+///
 /// # Returns "/users/{uid}"
-/// 
+///
 fn get_route_key(request: &Request) -> String {
     if let Some(req_ctx) = request.request_context_ref() {
         if let RequestContext::ApiGatewayV1(rcx) = req_ctx {
@@ -67,11 +86,11 @@ fn get_route_key(request: &Request) -> String {
 }
 
 /// Merge method and real path (without stage) as one string.
-/// 
+///
 /// The route_key example: "ANY /users/{uid}" where raw path = "/stage/users/1234"
-/// 
+///
 /// # Return "GET/users/{uid}" (and 1234 should be in path_parameters)
-/// 
+///
 fn get_method_path(request: &Request) -> String {
     let route_key = get_route_key(request);
     format!("{}{}", request.method(), route_key)
@@ -131,7 +150,26 @@ fn get_cookies(request: &Request) -> Option<HashMap<String, String>> {
     }
 }
 
-/// Parse PASETOS token to get sub as uid, aud as appid, and role to save in claims.
+/// Parse a PASETO token and fold its claims into `claims`.
+///
+/// Standard/registered JWT claims (`iss`, `sub`, `aud`, `exp`, `nbf`, `iat`,
+/// `jti` — see [`Claims::REGISTERED_CLAIMS`]) are excluded; everything else is
+/// copied verbatim so that any application-defined claim surfaces in the
+/// handler's claims map without per-claim plumbing.
+///
+/// The three explicit derived mappings (`sub` → `uid`, `aud` → `appid`) are
+/// applied **last**, so they win over any custom claim of the same name and
+/// preserve the historical contract. `role` is a non-registered custom claim
+/// and is copied by the loop above; the explicit block is retained for
+/// documentation clarity.
+///
+/// Verification goes through the shared [`Verifier`], so it is `async` even on
+/// the `env` key source: the async entry points are API-stability, not I/O.
+///
+/// A malformed or unverifiable token is **not** fatal here — the claims map is
+/// returned with the token's claims simply absent. Handlers remain responsible
+/// for requiring the claims they need via `missing_token_claim`, so this is not
+/// a fail-open change.
 ///
 /// # Arguments
 ///
@@ -140,31 +178,88 @@ fn get_cookies(request: &Request) -> Option<HashMap<String, String>> {
 ///
 /// # Returns the updated claims
 ///
-fn parse_jwt_for_claims(jwt: &str, mut claims: HashMap<String, Value>) -> HashMap<String, Value> {
-    let k = &PASETO_KEYS;
-    let token_claims: Result<Claims, RouterError> = k.verify_token(jwt);
+async fn parse_jwt_for_claims(
+    jwt: &str,
+    mut claims: HashMap<String, Value>,
+) -> HashMap<String, Value> {
+    let token_claims: Result<Claims, RouterError> = match paseto_verifier().await {
+        Ok(verifier) => verifier.verify_token(jwt).await,
+        // A verifier that cannot be constructed is a server misconfiguration
+        // (500), not a caller auth failure. `from_request` keeps its `Self`
+        // return type, so this degrades to "no token claims" and the handlers
+        // still reject anything requiring `uid`/`role`. That is strictly better
+        // than the `LazyLock` this replaced, which `.expect`-ed and so panicked
+        // the whole Lambda instance when the key was missing.
+        Err(e) => Err(e),
+    };
+    // Log the reason, never the token: neither the raw `jwt` nor any claim value
+    // may reach the log. `RouterError`'s message is our own text — `verifier.rs`
+    // renders pasetors failures without token material — so `{e}` is safe.
+    if let Err(e) = &token_claims {
+        tracing::warn!("PASETO token verification failed: {e}");
+    }
     if let Ok(tclaims) = token_claims {
-        if let Some(uid) = tclaims.get_claim("sub") {
-            claims.insert("uid".to_string(), uid.to_owned());
-        }
-        if let Some(aud) = tclaims.get_claim("aud") {
-            claims.insert("appid".to_string(), aud.to_owned());
-        }
-        if let Some(role) = tclaims.get_claim("role") {
-            claims.insert("role".to_string(), role.to_owned());
-        }
+        merge_paseto_claims(&tclaims, &mut claims);
     }
     claims
 }
 
+/// Copy every non-registered PASETO claim from `tclaims` into `out`, then
+/// apply the three explicit derived mappings so they win on collision.
+///
+/// Registered claims (`iss`, `sub`, `aud`, `exp`, `nbf`, `iat`, `jti`) are
+/// excluded; they are PASETO framework concerns and must not leak into the
+/// handler-visible claims map.
+///
+/// The JSON round-trip via `to_string()` is the only public enumeration path
+/// available on pasetors 0.8.x's `Claims` (the inner map is private). If the
+/// round-trip fails we silently skip the custom-claim copy — the derived
+/// mappings below are unaffected because they query individual claims
+/// directly.
+fn merge_paseto_claims(tclaims: &Claims, out: &mut HashMap<String, Value>) {
+    // Blanket-copy non-registered claims first.
+    if let Ok(json) = tclaims.to_string() {
+        if let Ok(map) = serde_json::from_str::<serde_json::Map<String, Value>>(&json) {
+            for (k, v) in map {
+                if !Claims::REGISTERED_CLAIMS.contains(&k.as_str()) {
+                    out.insert(k, v);
+                }
+            }
+        } else {
+            tracing::warn!("PASETO custom claims round-trip parse failed");
+        }
+    } else {
+        tracing::warn!("PASETO custom claims serialization failed");
+    }
+    // Derived/renamed keys win, preserving the historical contract.
+    if let Some(uid) = tclaims.get_claim("sub") {
+        out.insert("uid".to_string(), uid.to_owned());
+    }
+    if let Some(aud) = tclaims.get_claim("aud") {
+        out.insert("appid".to_string(), aud.to_owned());
+    }
+    // `role` is already copied above (it is non-registered). This block exists
+    // to document the historical intent and as a no-op safety net should the
+    // registration set ever be extended.
+    if let Some(role) = tclaims.get_claim("role") {
+        out.insert("role".to_string(), role.to_owned());
+    }
+}
+
 impl RouteHandlerInput {
-    pub fn from_request(request: &Request) -> Self {
+    /// Build the handler input for one request.
+    ///
+    /// Token verification is asynchronous: when the deployment is wired to AWS
+    /// KMS, the shared [`Verifier`] is built on the first request that actually
+    /// carries a `jwt` cookie. Requests without a `jwt` cookie never touch it,
+    /// so an offline caller needs no key material and no AWS credentials.
+    pub async fn from_request(request: &Request) -> Self {
         tracing::info!("\n>> from_request({:?})", request);
         let mut rclaims = get_claims(request);
         let rcookies = get_cookies(request);
         if let Some(ref cookies) = rcookies {
             if let Some(jwt) = cookies.get("jwt") {
-                rclaims = parse_jwt_for_claims(jwt, rclaims);
+                rclaims = parse_jwt_for_claims(jwt, rclaims).await;
             }
         }
         tracing::info!("\n>># parsed claims: {:?}", rclaims);
@@ -181,7 +276,10 @@ impl RouteHandlerInput {
     }
 
     pub fn get_body_prop_as_str(&self, attr_name: &str) -> Option<&str> {
-        self.body.as_ref().and_then(|b| b.get(attr_name)).and_then(Value::as_str)
+        self.body
+            .as_ref()
+            .and_then(|b| b.get(attr_name))
+            .and_then(Value::as_str)
     }
 
     pub fn get_optional_body_prop(&self, property_name: &str) -> Option<String> {
@@ -212,7 +310,9 @@ impl RouteHandlerInput {
     }
 
     pub fn get_body_or_error(&self) -> Result<&Value, RouterError> {
-        self.body.as_ref().ok_or_else(|| bad_request_error("Missing body"))
+        self.body
+            .as_ref()
+            .ok_or_else(|| bad_request_error("Missing body"))
     }
 
     /// Get a value as Result<String> from a QueryMap by a key.
@@ -317,9 +417,9 @@ impl RouteHandlerInput {
 #[cfg(test)]
 mod test {
     use super::*;
-    use http::Request;
-use serde_json::json;
     use aws_lambda_events::apigw::ApiGatewayV2httpRequestContext;
+    use http::Request;
+    use serde_json::json;
 
     #[test]
     fn test_get_method_path() {
@@ -410,10 +510,9 @@ use serde_json::json;
 
         let body_text = "{\r\n  \"email\": \"qywen@hotmail.com\",\r\n  \"password\": \"1234\",\r\n  \"appid\": \"ici_email\",\r\n\t\"role\": \"admin\"\r\n}";
         // let body_text = "{ \"email\": \"qywen@hotmail.com\",\r\n  \"appid\": \"ici_email\"}";
-        let request = Request::new(Body::Text(body_text.to_string()))
-            .with_raw_http_path("/users");
+        let request = Request::new(Body::Text(body_text.to_string())).with_raw_http_path("/users");
 
-            if let Some(body) = get_body_value(&request) {
+        if let Some(body) = get_body_value(&request) {
             // check body content
             assert_eq!(body["email"].as_str(), Some("qywen@hotmail.com"));
             assert_eq!(body["appid"].as_str(), Some("ici_email"));
@@ -422,15 +521,63 @@ use serde_json::json;
         };
     }
 
-    #[test]
-    fn test_from_request() {
+    // Offline by design: the request has a JSON body and no `cookie` header, so
+    // `get_cookies` returns `None`, `parse_jwt_for_claims` is never reached, and
+    // the shared Verifier is never built. Do not add a cookie here — that would
+    // make this test need a PASETO public key.
+    #[tokio::test]
+    async fn test_from_request() {
         let body_text = "{\r\n  \"email\": \"qywen@hotmail.com\",\r\n  \"password\": \"1234\",\r\n  \"appid\": \"ici_email\",\r\n\t\"role\": \"admin\"\r\n}";
         let request = Request::new(Body::Text(body_text.to_string())).with_raw_http_path("/users");
-        let ri = RouteHandlerInput::from_request(&request);
+        let ri = RouteHandlerInput::from_request(&request).await;
         let pe = ri.get_required_body_prop("email");
         assert!(pe.is_ok());
         assert_eq!(pe.unwrap().as_str(), Some("qywen@hotmail.com"));
         let pa = ri.get_required_body_prop_as_str("appid");
         assert_eq!(pa.unwrap(), "ici_email");
+    }
+
+    #[test]
+    fn test_merge_paseto_claims_copies_custom_excludes_registered() {
+        // Build a Claims object with registered + custom claims.
+        let mut c = Claims::new().expect("Claims::new should succeed");
+        c.set_expires_in(&core::time::Duration::from_secs(3600))
+            .unwrap();
+        c.subject("alice").unwrap();
+        c.audience("my-app").unwrap();
+        c.issuer("issuer").unwrap();
+        c.add_additional("tenant", "t1").unwrap();
+        c.add_additional("scope", "read").unwrap();
+        c.add_additional("device_id", "d1").unwrap();
+        c.add_additional("typ", "refresh").unwrap();
+        // Custom claim colliding with a derived key: sub→uid must win.
+        c.add_additional("uid", "custom_uid").unwrap();
+        // Custom claim colliding with appid: aud→appid must win.
+        c.add_additional("appid", "custom_appid").unwrap();
+
+        let mut out: HashMap<String, Value> = HashMap::new();
+        out.insert("uid".to_string(), json!("old"));
+        out.insert("appid".to_string(), json!("old"));
+        out.insert("role".to_string(), json!("old"));
+        merge_paseto_claims(&c, &mut out);
+
+        // Derived keys win over custom.
+        assert_eq!(out.get("uid"), Some(&json!("alice")));
+        assert_eq!(out.get("appid"), Some(&json!("my-app")));
+        // Role stays whatever it was (token had no role claim here).
+        assert_eq!(out.get("role"), Some(&json!("old")));
+        // Custom claims were copied.
+        assert_eq!(out.get("tenant"), Some(&json!("t1")));
+        assert_eq!(out.get("scope"), Some(&json!("read")));
+        assert_eq!(out.get("device_id"), Some(&json!("d1")));
+        assert_eq!(out.get("typ"), Some(&json!("refresh")));
+        // Registered claims must NOT appear in the output.
+        assert!(!out.contains_key("iss"));
+        assert!(!out.contains_key("sub"));
+        assert!(!out.contains_key("aud"));
+        assert!(!out.contains_key("exp"));
+        assert!(!out.contains_key("nbf"));
+        assert!(!out.contains_key("iat"));
+        assert!(!out.contains_key("jti"));
     }
 }

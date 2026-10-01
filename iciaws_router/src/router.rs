@@ -37,7 +37,7 @@ impl Router {
     }
 
     pub async fn route(&self, request: Request) -> RouteHandlerOutput {
-        let input = RouteHandlerInput::from_request(&request);
+        let input = RouteHandlerInput::from_request(&request).await;
 
         let origin = request
             .headers()
