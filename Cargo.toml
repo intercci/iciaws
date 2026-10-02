@@ -8,6 +8,7 @@ members = [
     "iciaws_sns",
     "iciaws_test_helper",
     "iciaws_token"]
+    
 resolver = "2"
 
 [workspace.dependencies]

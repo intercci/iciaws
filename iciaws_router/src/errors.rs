@@ -30,8 +30,6 @@ pub enum RouterError {
     SerdeJsonError(#[from] serde_json::Error),
     #[error("UTF8 convert error")]
     Utf8ConvertError(#[from] std::str::Utf8Error),
-    #[error("base64 error")]
-    Base64DecodeError(#[from] base64::DecodeError),
     #[error("pasetos error")]
     PasetosError(#[from] pasetors::errors::Error),
 }

@@ -76,6 +76,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "need local dynamodb"]
     async fn test_addon_dynamo() {
         // this test should run using local dynamodb with DYNAMO_ENDPOINT_URL=http://localhost:8000 set in .env
         let dynamo = get_dynamo_client(Some("ici-email")).await;
