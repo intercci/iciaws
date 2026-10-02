@@ -1,0 +1,19 @@
+[package]
+name = "iciaws_token"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+dotenv = { workspace = true }
+base64 = { workspace = true }
+pasetors = { version = "0.8.1", features = ["v3"] }
+aws-config = { workspace = true }
+aws-sdk-kms = "1.110.0"
+p384 = "0.14.0"
+tracing = "0.1.44"
+
+[dev-dependencies]
+serial_test = "4.0.1"
+tokio = { workspace = true }

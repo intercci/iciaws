@@ -35,9 +35,9 @@
 //! The header only ever selects the *parser*; the key always comes from
 //! configuration.
 
-use crate::errors::RouterError;
+use crate::errors::TokenError;
 use crate::kms::{self, KeySource, KmsError, PasetoVersion, V3_PUBLIC_KEY_LEN, V4_PUBLIC_KEY_LEN};
-use lambda_http::tracing;
+use tracing;
 use pasetors::Public;
 use pasetors::claims::{Claims, ClaimsValidationRules};
 use pasetors::keys::AsymmetricPublicKey;
@@ -98,9 +98,9 @@ impl Verifier {
     ///
     /// # Errors
     ///
-    /// * [`RouterError::KeyPairError`] — unusable configuration, or a
+    /// * [`TokenError::KeyPairError`] — unusable configuration, or a
     ///   `GetPublicKey` / transport failure.
-    pub async fn new(key_id: Option<String>) -> Result<Self, RouterError> {
+    pub async fn new(key_id: Option<String>) -> Result<Self, TokenError> {
         kms::load_dotenv_if_local();
         let source = KeySource::resolve(None)?;
         Self::build(source, key_id).await
@@ -119,13 +119,13 @@ impl Verifier {
     pub async fn with_source(
         key_id: Option<String>,
         source: Option<&str>,
-    ) -> Result<Self, RouterError> {
+    ) -> Result<Self, TokenError> {
         kms::load_dotenv_if_local();
         let source = KeySource::resolve(source)?;
         Self::build(source, key_id).await
     }
 
-    async fn build(source: KeySource, key_id: Option<String>) -> Result<Self, RouterError> {
+    async fn build(source: KeySource, key_id: Option<String>) -> Result<Self, TokenError> {
         match source {
             KeySource::Env => Self::from_env_keys(),
             KeySource::Kms => Self::from_kms(key_id).await,
@@ -133,12 +133,12 @@ impl Verifier {
     }
 
     /// Build from `PASETO_PUB_KEY`. Purely local: no AWS client is constructed.
-    fn from_env_keys() -> Result<Self, RouterError> {
+    fn from_env_keys() -> Result<Self, TokenError> {
         let configured = env::var(kms::PUB_KEY_ENV)
-            .map_err(|_| RouterError::KeyPairError(PUB_KEY_MISSING.to_string()))?;
+            .map_err(|_| TokenError::KeyPairError(PUB_KEY_MISSING.to_string()))?;
         let trimmed = configured.trim();
         if trimmed.is_empty() {
-            return Err(RouterError::KeyPairError(PUB_KEY_MISSING.to_string()));
+            return Err(TokenError::KeyPairError(PUB_KEY_MISSING.to_string()));
         }
 
         let bytes = kms::b64url_decode(trimmed)?;
@@ -146,7 +146,7 @@ impl Verifier {
         // in the `env` source, and inspecting key material (never the token) is
         // the only honest signal available.
         let version = PasetoVersion::from_key_len(bytes.len()).ok_or_else(|| {
-            RouterError::KeyPairError(format!(
+            TokenError::KeyPairError(format!(
                 "PASETO_PUB_KEY must be {V3_PUBLIC_KEY_LEN} raw bytes (v3) or \
                  {V4_PUBLIC_KEY_LEN} raw bytes (v4), got {}",
                 bytes.len()
@@ -158,12 +158,12 @@ impl Verifier {
         let public = match version {
             PasetoVersion::V3 => {
                 PublicMaterial::V3(AsymmetricPublicKey::<V3>::from(&bytes).map_err(|e| {
-                    RouterError::KeyPairError(format!("invalid v3 public key: {e}"))
+                    TokenError::KeyPairError(format!("invalid v3 public key: {e}"))
                 })?)
             }
             PasetoVersion::V4 => {
                 PublicMaterial::V4(AsymmetricPublicKey::<V4>::from(&bytes).map_err(|e| {
-                    RouterError::KeyPairError(format!("invalid v4 public key: {e}"))
+                    TokenError::KeyPairError(format!("invalid v4 public key: {e}"))
                 })?)
             }
         };
@@ -182,7 +182,7 @@ impl Verifier {
     }
 
     /// Fetch the public key from KMS and pin the version to its `KeySpec`.
-    async fn from_kms(key_id: Option<String>) -> Result<Self, RouterError> {
+    async fn from_kms(key_id: Option<String>) -> Result<Self, TokenError> {
         let key_id = kms::resolve_key_id(key_id)?;
         let client = kms::kms_client().await;
         let output = client
@@ -198,7 +198,7 @@ impl Verifier {
         // Never `unwrap` an SDK `Option` accessor — an absent KeySpec is a
         // malformed response, not a programming error.
         let spec = output.key_spec().ok_or_else(|| {
-            RouterError::KeyPairError("KMS GetPublicKey returned no KeySpec".to_string())
+            TokenError::KeyPairError("KMS GetPublicKey returned no KeySpec".to_string())
         })?;
         let version = PasetoVersion::from_key_spec(spec)?;
 
@@ -233,9 +233,9 @@ impl Verifier {
     ///
     /// Every failure — wrong version, malformed token, bad signature, expired or
     /// otherwise invalid claims — is reported as
-    /// [`RouterError::Unauthenticated`], because all of them mean "this token is
+    /// [`TokenError::Unauthenticated`], because all of them mean "this token is
     /// not acceptable". Token bytes are never included in the message.
-    pub async fn verify_token(&self, token: &str) -> Result<Claims, RouterError> {
+    pub async fn verify_token(&self, token: &str) -> Result<Claims, TokenError> {
         self.verify_token_with_footer(token, None).await
     }
 
@@ -253,7 +253,7 @@ impl Verifier {
         &self,
         token: &str,
         footer: Option<&[u8]>,
-    ) -> Result<Claims, RouterError> {
+    ) -> Result<Claims, TokenError> {
         let raw = token.strip_prefix(BEARER).unwrap_or(token);
 
         // The version is configuration, never the token. Refusing a mismatched
@@ -262,12 +262,12 @@ impl Verifier {
         // pinned version) is distinguishable from a malformed request.
         match PasetoVersion::from_token(raw) {
             None => {
-                return Err(RouterError::Unauthenticated(
+                return Err(TokenError::Unauthenticated(
                     "unrecognized PASETO header".to_string(),
                 ));
             }
             Some(found) if found != self.version => {
-                return Err(RouterError::Unauthenticated(format!(
+                return Err(TokenError::Unauthenticated(format!(
                     "token version {found:?} does not match configured version {:?}",
                     self.version
                 )));
@@ -318,8 +318,8 @@ impl Verifier {
 /// Written as a function rather than a `map_err` closure at each call site so
 /// the mapping — and the promise that token bytes stay out of the message — has
 /// exactly one place to be wrong.
-fn unauthenticated(err: pasetors::errors::Error) -> RouterError {
-    RouterError::Unauthenticated(format!("token rejected: {err}"))
+fn unauthenticated(err: pasetors::errors::Error) -> TokenError {
+    TokenError::Unauthenticated(format!("token rejected: {err}"))
 }
 
 /// Parse the payload and apply the `ValidAt` rules.
@@ -329,7 +329,7 @@ fn unauthenticated(err: pasetors::errors::Error) -> RouterError {
 /// `ClaimsValidationRules::default()` — the same defaults the claims-aware
 /// `pasetors::public::verify` applies. Owning the [`Claims`] is what lets this
 /// return them without borrowing the `TrustedToken`.
-fn validated_claims(payload: &str) -> Result<Claims, RouterError> {
+fn validated_claims(payload: &str) -> Result<Claims, TokenError> {
     let claims = Claims::from_string(payload).map_err(unauthenticated)?;
     ClaimsValidationRules::default()
         .validate_claims(&claims)
@@ -491,9 +491,9 @@ pub(crate) mod test {
 
     /// Assert a 401. Takes the error by reference so callers can still assert on
     /// the message afterwards.
-    fn assert_401(err: &RouterError) {
+    fn assert_401(err: &TokenError) {
         assert!(
-            matches!(err, RouterError::Unauthenticated(_)),
+            matches!(err, TokenError::Unauthenticated(_)),
             "expected a 401 Unauthenticated, got {err:?}"
         );
     }
@@ -675,7 +675,7 @@ pub(crate) mod test {
             .await
             .expect_err("a verifier with no key must not be constructible");
         assert!(
-            matches!(err, RouterError::KeyPairError(_)),
+            matches!(err, TokenError::KeyPairError(_)),
             "expected KeyPairError, got {err:?}"
         );
         assert!(err.to_string().contains("PASETO_PUB_KEY"), "{err}");
@@ -691,7 +691,7 @@ pub(crate) mod test {
             Verifier::with_source(None, Some("env"))
                 .await
                 .expect_err("must reject"),
-            RouterError::KeyPairError(_)
+            TokenError::KeyPairError(_)
         ));
     }
 
@@ -704,7 +704,7 @@ pub(crate) mod test {
         let err = Verifier::with_source(None, Some("env"))
             .await
             .expect_err("a 7-byte key must be rejected, not unwrapped");
-        assert!(matches!(err, RouterError::KeyPairError(_)), "{err:?}");
+        assert!(matches!(err, TokenError::KeyPairError(_)), "{err:?}");
         assert!(err.to_string().contains("49"), "must name the sizes: {err}");
         assert!(err.to_string().contains("32"), "must name the sizes: {err}");
     }
@@ -730,7 +730,7 @@ pub(crate) mod test {
         let err = Verifier::with_source(None, Some("vault"))
             .await
             .expect_err("must reject");
-        assert!(matches!(err, RouterError::KeyPairError(_)), "{err:?}");
+        assert!(matches!(err, TokenError::KeyPairError(_)), "{err:?}");
         assert!(
             err.to_string().contains("vault"),
             "the message must quote the offending value: {err}"
@@ -772,7 +772,7 @@ pub(crate) mod test {
         // silently verifying with local keys when AWS was the configured source
         // is exactly the downgrade this must not perform.
         let err = Verifier::new(None).await.expect_err("must reject");
-        assert!(matches!(err, RouterError::KeyPairError(_)), "{err:?}");
+        assert!(matches!(err, TokenError::KeyPairError(_)), "{err:?}");
         assert!(
             err.to_string().contains("KMS_KEY_ID"),
             "the message must name the variable to set: {err}"

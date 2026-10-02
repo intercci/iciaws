@@ -48,7 +48,7 @@
 //! every signature is one `Sign` call, which is the entire point of keeping the
 //! key in KMS.
 
-use crate::errors::RouterError;
+use crate::errors::TokenError;
 use crate::kms::{
     self, KeySource, KmsError, PasetoVersion, V3_PUBLIC_KEY_LEN, V3_PUBLIC_SIG_LEN,
     V3_SECRET_KEY_LEN, V4_PUBLIC_KEY_LEN, V4_PUBLIC_SIG_LEN, V4_SECRET_KEY_LEN,
@@ -57,7 +57,7 @@ use aws_sdk_kms::types::MessageType;
 // Re-exported by the generated SDK client rather than depended on directly: the
 // crate's own `Cargo.toml` is off-limits, and this is the exact type `Sign::message` wants.
 use aws_sdk_kms::primitives::Blob;
-use lambda_http::tracing;
+use tracing;
 use pasetors::claims::Claims;
 use pasetors::keys::AsymmetricSecretKey;
 use pasetors::version3::V3;
@@ -132,9 +132,9 @@ impl Signer {
     ///
     /// # Errors
     ///
-    /// * [`RouterError::KeyPairError`] — unusable configuration, or a
+    /// * [`TokenError::KeyPairError`] — unusable configuration, or a
     ///   `GetPublicKey` / transport failure.
-    pub async fn new(key_id: Option<String>) -> Result<Self, RouterError> {
+    pub async fn new(key_id: Option<String>) -> Result<Self, TokenError> {
         kms::load_dotenv_if_local();
         let source = KeySource::resolve(None)?;
         Self::build(source, key_id).await
@@ -153,13 +153,13 @@ impl Signer {
     pub async fn with_source(
         key_id: Option<String>,
         source: Option<&str>,
-    ) -> Result<Self, RouterError> {
+    ) -> Result<Self, TokenError> {
         kms::load_dotenv_if_local();
         let source = KeySource::resolve(source)?;
         Self::build(source, key_id).await
     }
 
-    async fn build(source: KeySource, key_id: Option<String>) -> Result<Self, RouterError> {
+    async fn build(source: KeySource, key_id: Option<String>) -> Result<Self, TokenError> {
         match source {
             KeySource::Env => Self::from_env_keys(),
             KeySource::Kms => Self::from_kms(key_id).await,
@@ -167,12 +167,12 @@ impl Signer {
     }
 
     /// Build from `PASETO_PRV_KEY`. Purely local: no AWS client is constructed.
-    fn from_env_keys() -> Result<Self, RouterError> {
+    fn from_env_keys() -> Result<Self, TokenError> {
         let configured = env::var(kms::PRV_KEY_ENV)
-            .map_err(|_| RouterError::KeyPairError(NO_SIGNING_KEY.to_string()))?;
+            .map_err(|_| TokenError::KeyPairError(NO_SIGNING_KEY.to_string()))?;
         let trimmed = configured.trim();
         if trimmed.is_empty() {
-            return Err(RouterError::KeyPairError(NO_SIGNING_KEY.to_string()));
+            return Err(TokenError::KeyPairError(NO_SIGNING_KEY.to_string()));
         }
 
         let bytes = kms::b64url_decode(trimmed)?;
@@ -182,7 +182,7 @@ impl Signer {
             V4_SECRET_KEY_LEN => PasetoVersion::V4,
             V3_SECRET_KEY_LEN => PasetoVersion::V3,
             other => {
-                return Err(RouterError::KeyPairError(format!(
+                return Err(TokenError::KeyPairError(format!(
                     "PASETO_PRV_KEY must be {V4_SECRET_KEY_LEN} raw bytes (v4) or \
                      {V3_SECRET_KEY_LEN} raw bytes (v3), got {other}"
                 )));
@@ -194,12 +194,12 @@ impl Signer {
         let env_secret = match version {
             PasetoVersion::V4 => {
                 SecretMaterial::V4(AsymmetricSecretKey::<V4>::from(&bytes).map_err(|e| {
-                    RouterError::KeyPairError(format!("invalid v4 secret key: {e}"))
+                    TokenError::KeyPairError(format!("invalid v4 secret key: {e}"))
                 })?)
             }
             PasetoVersion::V3 => {
                 SecretMaterial::V3(AsymmetricSecretKey::<V3>::from(&bytes).map_err(|e| {
-                    RouterError::KeyPairError(format!("invalid v3 secret key: {e}"))
+                    TokenError::KeyPairError(format!("invalid v3 secret key: {e}"))
                 })?)
             }
         };
@@ -224,7 +224,7 @@ impl Signer {
     ///
     /// The public key is fetched even though this instance only signs, because
     /// v3's PAE puts it first and the signer therefore has to hold it.
-    async fn from_kms(key_id: Option<String>) -> Result<Self, RouterError> {
+    async fn from_kms(key_id: Option<String>) -> Result<Self, TokenError> {
         let key_id = kms::resolve_key_id(key_id)?;
         let client = kms::kms_client().await;
         let output = client
@@ -239,7 +239,7 @@ impl Signer {
         // unrecognised spec onto `UnsupportedKeySpec` rather than a compile error.
         // Never `unwrap` an SDK `Option` accessor.
         let spec = output.key_spec().ok_or_else(|| {
-            RouterError::KeyPairError("KMS GetPublicKey returned no KeySpec".to_string())
+            TokenError::KeyPairError("KMS GetPublicKey returned no KeySpec".to_string())
         })?;
         let version = PasetoVersion::from_key_spec(spec)?;
 
@@ -264,7 +264,7 @@ impl Signer {
             PasetoVersion::V4 => V4_PUBLIC_KEY_LEN,
         };
         if kms_public_key.len() != expected {
-            return Err(RouterError::KeyPairError(format!(
+            return Err(TokenError::KeyPairError(format!(
                 "KMS public key length mismatch for {version:?}: got {}, want {expected}",
                 kms_public_key.len()
             )));
@@ -287,14 +287,14 @@ impl Signer {
     ///
     /// # Errors
     ///
-    /// [`RouterError::KeyPairError`] (500) on any failure — a signing failure is
+    /// [`TokenError::KeyPairError`] (500) on any failure — a signing failure is
     /// a server or key problem, never a caller-auth problem, so it must never be
     /// reported as 401.
     pub async fn sign_claims(
         &self,
         claims: &Claims,
         footer: Option<&[u8]>,
-    ) -> Result<String, RouterError> {
+    ) -> Result<String, TokenError> {
         match self.source {
             KeySource::Env => self.sign_local(claims, footer),
             KeySource::Kms => self.sign_via_kms(claims, footer).await,
@@ -304,22 +304,22 @@ impl Signer {
     /// Local signing: we hold the secret, so pasetors does everything — PAE,
     /// signature maths and token assembly included. Nothing here re-implements any
     /// part of the specification.
-    fn sign_local(&self, claims: &Claims, footer: Option<&[u8]>) -> Result<String, RouterError> {
+    fn sign_local(&self, claims: &Claims, footer: Option<&[u8]>) -> Result<String, TokenError> {
         let payload = kms::claims_to_payload(claims)?;
         let secret = self.env_secret.as_ref().ok_or_else(|| {
-            RouterError::KeyPairError(
+            TokenError::KeyPairError(
                 "local signing requested but this signer holds no local secret key".to_string(),
             )
         })?;
         match secret {
             SecretMaterial::V3(key) => {
                 pasetors::version3::PublicToken::sign(key, &payload, footer, None).map_err(|e| {
-                    RouterError::KeyPairError(format!("PASETO v3 signing failed: {e}"))
+                    TokenError::KeyPairError(format!("PASETO v3 signing failed: {e}"))
                 })
             }
             SecretMaterial::V4(key) => {
                 pasetors::version4::PublicToken::sign(key, &payload, footer, None).map_err(|e| {
-                    RouterError::KeyPairError(format!("PASETO v4 signing failed: {e}"))
+                    TokenError::KeyPairError(format!("PASETO v4 signing failed: {e}"))
                 })
             }
         }
@@ -330,7 +330,7 @@ impl Signer {
         &self,
         claims: &Claims,
         footer: Option<&[u8]>,
-    ) -> Result<String, RouterError> {
+    ) -> Result<String, TokenError> {
         let payload = kms::claims_to_payload(claims)?;
         let message = self.kms_message(&payload, footer.unwrap_or(&[]))?;
         let signature = self.kms_sign(&message).await?;
@@ -347,7 +347,7 @@ impl Signer {
     /// Split out from [`Signer::sign_via_kms`] because this framing is the part
     /// that is easy to get subtly wrong and the part that cannot be exercised
     /// through the network — which makes it the part that most needs a test.
-    fn kms_message(&self, payload: &[u8], footer: &[u8]) -> Result<Vec<u8>, RouterError> {
+    fn kms_message(&self, payload: &[u8], footer: &[u8]) -> Result<Vec<u8>, TokenError> {
         match self.version {
             // v4: four pieces, no key material.
             PasetoVersion::V4 => {
@@ -360,7 +360,7 @@ impl Signer {
             // pieces silently breaks every v3 verification.
             PasetoVersion::V3 => {
                 if self.kms_public_key.len() != V3_PUBLIC_KEY_LEN {
-                    return Err(RouterError::KeyPairError(format!(
+                    return Err(TokenError::KeyPairError(format!(
                         "PASETO v3 PAE needs the {V3_PUBLIC_KEY_LEN}-byte compressed public key \
                          first, but {} bytes are loaded",
                         self.kms_public_key.len()
@@ -380,7 +380,7 @@ impl Signer {
 
     /// Sign one already-framed message and return the raw signature bytes in the
     /// exact form PASETO embeds.
-    async fn kms_sign(&self, message: &[u8]) -> Result<Vec<u8>, RouterError> {
+    async fn kms_sign(&self, message: &[u8]) -> Result<Vec<u8>, TokenError> {
         let client = kms::kms_client().await;
         let output = client
             .sign()
@@ -399,7 +399,7 @@ impl Signer {
         // Never `unwrap` an SDK `Option` accessor.
         let signature = output
             .signature()
-            .ok_or_else(|| RouterError::KeyPairError(NO_SIGNATURE.to_string()))?;
+            .ok_or_else(|| TokenError::KeyPairError(NO_SIGNATURE.to_string()))?;
         let raw = signature.as_ref();
 
         match self.version {
@@ -408,7 +408,7 @@ impl Signer {
             // consumes a digest and hashes again, which would double-hash.
             PasetoVersion::V4 => {
                 if raw.len() != V4_PUBLIC_SIG_LEN {
-                    return Err(RouterError::KeyPairError(format!(
+                    return Err(TokenError::KeyPairError(format!(
                         "Ed25519 signature must be {V4_PUBLIC_SIG_LEN} bytes, got {}",
                         raw.len()
                     )));
@@ -432,7 +432,7 @@ impl Signer {
         sub: &str,
         aud: &str,
         extra: Option<HashMap<String, String>>,
-    ) -> Result<String, RouterError> {
+    ) -> Result<String, TokenError> {
         self.gen_token(sub, aud, ACCESS_TOKEN_SECONDS, extra).await
     }
 
@@ -442,7 +442,7 @@ impl Signer {
         sub: &str,
         aud: &str,
         extra: Option<HashMap<String, String>>,
-    ) -> Result<String, RouterError> {
+    ) -> Result<String, TokenError> {
         let mut extras = extra.unwrap_or_default();
         // The discriminator is set here, at the one place that knows which kind of
         // token is being minted, so a caller cannot forget it and a downstream
@@ -458,7 +458,7 @@ impl Signer {
         aud: &str,
         secs: u64,
         extra: Option<HashMap<String, String>>,
-    ) -> Result<String, RouterError> {
+    ) -> Result<String, TokenError> {
         let claims = build_claims(sub, aud, secs, extra)?;
         self.sign_claims(&claims, None).await
     }
@@ -490,7 +490,7 @@ fn build_claims(
     aud: &str,
     secs: u64,
     extra: Option<HashMap<String, String>>,
-) -> Result<Claims, RouterError> {
+) -> Result<Claims, TokenError> {
     let duration = Duration::from_secs(secs);
     let mut claims = Claims::new_expires_in(&duration)?;
     claims.subject(sub)?;
@@ -812,7 +812,7 @@ mod test {
         let err = signer
             .kms_message(b"payload", b"")
             .expect_err("must refuse");
-        assert!(matches!(err, RouterError::KeyPairError(_)), "{err:?}");
+        assert!(matches!(err, TokenError::KeyPairError(_)), "{err:?}");
         assert!(err.to_string().contains("49"), "must name the size: {err}");
     }
 
@@ -849,7 +849,7 @@ mod test {
             .await
             .expect_err("a different footer must be rejected");
         assert!(
-            matches!(err, RouterError::Unauthenticated(_)),
+            matches!(err, TokenError::Unauthenticated(_)),
             "expected 401, got {err:?}"
         );
     }
@@ -864,7 +864,7 @@ mod test {
             .await
             .expect_err("a signer with no secret must not be constructible");
         assert!(
-            matches!(err, RouterError::KeyPairError(_)),
+            matches!(err, TokenError::KeyPairError(_)),
             "expected KeyPairError, got {err:?}"
         );
         assert!(
@@ -883,7 +883,7 @@ mod test {
             Signer::with_source(None, Some("env"))
                 .await
                 .expect_err("must reject"),
-            RouterError::KeyPairError(_)
+            TokenError::KeyPairError(_)
         ));
     }
 
@@ -897,7 +897,7 @@ mod test {
             .await
             .expect_err("a 7-byte secret must be rejected, not unwrapped");
         assert!(
-            matches!(err, RouterError::KeyPairError(_)),
+            matches!(err, TokenError::KeyPairError(_)),
             "expected KeyPairError, got {err:?}"
         );
         assert!(err.to_string().contains("64"), "must name the sizes: {err}");
@@ -915,7 +915,7 @@ mod test {
         let err = Signer::with_source(None, Some("vault"))
             .await
             .expect_err("must reject");
-        assert!(matches!(err, RouterError::KeyPairError(_)), "{err:?}");
+        assert!(matches!(err, TokenError::KeyPairError(_)), "{err:?}");
         assert!(
             err.to_string().contains("vault"),
             "the message must quote the offending value: {err}"
@@ -937,7 +937,7 @@ mod test {
         );
 
         let err = Signer::new(None).await.expect_err("must reject");
-        assert!(matches!(err, RouterError::KeyPairError(_)), "{err:?}");
+        assert!(matches!(err, TokenError::KeyPairError(_)), "{err:?}");
         assert!(
             err.to_string().contains("KMS_KEY_ID"),
             "the message must name the variable to set: {err}"

@@ -3,7 +3,7 @@ use super::errors::{
     RouterError, bad_request_error, missing_body_field, missing_parameter, missing_path_param,
     missing_token_claim, unauthorized_error,
 };
-use super::verifier::Verifier;
+use iciaws_token::verifier::Verifier;
 use aws_lambda_events::query_map::QueryMap;
 use lambda_http::request::RequestContext;
 use lambda_http::{Body, Request, RequestExt, tracing};
@@ -37,6 +37,7 @@ async fn paseto_verifier() -> Result<&'static Verifier, RouterError> {
     PASETO_VERIFIER
         .get_or_try_init(|| Verifier::new(None))
         .await
+        .map_err(RouterError::from)
 }
 
 #[derive(Debug, Default)]
@@ -183,7 +184,7 @@ async fn parse_jwt_for_claims(
     mut claims: HashMap<String, Value>,
 ) -> HashMap<String, Value> {
     let token_claims: Result<Claims, RouterError> = match paseto_verifier().await {
-        Ok(verifier) => verifier.verify_token(jwt).await,
+        Ok(verifier) => verifier.verify_token(jwt).await.map_err(RouterError::from),
         // A verifier that cannot be constructed is a server misconfiguration
         // (500), not a caller auth failure. `from_request` keeps its `Self`
         // return type, so this degrades to "no token claims" and the handlers

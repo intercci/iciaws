@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use iciaws_token::errors::TokenError;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -33,6 +34,32 @@ pub enum RouterError {
     Base64DecodeError(#[from] base64::DecodeError),
     #[error("pasetos error")]
     PasetosError(#[from] pasetors::errors::Error),
+}
+
+impl From<TokenError> for RouterError {
+    /// Mapping policy, deliberately explicit because `RouterError` variants
+    /// carry HTTP status codes. Mirrors the `impl From<KmsError>` in `kms.rs`
+    /// so the 401-vs-500 split is the same no matter which layer surfaced the
+    /// failure:
+    ///
+    /// * **401 `Unauthenticated`** — the caller's token could not be accepted:
+    ///   an explicit auth rejection, claims JSON that is not valid JSON, a
+    ///   payload that is not valid UTF-8, malformed base64, or a pasetors
+    ///   failure (bad signature bytes, expired token, wrong key, ...). These
+    ///   mean "your token is not acceptable", not "the server is broken".
+    /// * **500 `KeyPairError`** — the deployment itself is misconfigured: the
+    ///   key material could not be resolved or parsed. This is an operator
+    ///   problem and must not be reported to the client as an auth failure.
+    fn from(err: TokenError) -> Self {
+        match err {
+            TokenError::KeyPairError(msg) => RouterError::KeyPairError(msg),
+            TokenError::Unauthenticated(msg) => RouterError::Unauthenticated(msg),
+            TokenError::SerdeJsonError(e) => RouterError::Unauthenticated(e.to_string()),
+            TokenError::Utf8ConvertError(e) => RouterError::Unauthenticated(e.to_string()),
+            TokenError::Base64DecodeError(e) => RouterError::Unauthenticated(e.to_string()),
+            TokenError::PasetosError(e) => RouterError::Unauthenticated(e.to_string()),
+        }
+    }
 }
 
 pub struct ErrorCode {}

@@ -16,10 +16,9 @@ dotenv = { workspace = true }
 base64 = { workspace = true }
 pasetors = { version = "0.8.1", features = ["v3"] }
 aws-config = { workspace = true }
-aws-sdk-kms = "1.110.0"
-p384 = "0.14.0"
 
 iciaws_macros = { path =  "../iciaws_macros" }
+iciaws_token = { path = "../iciaws_token" }
 
 [dev-dependencies]
 aws-sdk-dynamodb = "1.105.0"

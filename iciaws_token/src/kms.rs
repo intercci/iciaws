@@ -44,12 +44,12 @@
 //! KMS ECDSA is non-deterministic (no RFC 6979). PASETO v3 explicitly permits
 //! CSPRNG nonces, so that is compliant.
 
-use crate::errors::RouterError;
+use crate::errors::TokenError;
 use aws_sdk_kms::types::{KeySpec, SigningAlgorithmSpec};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use dotenv::dotenv;
-use lambda_http::tracing;
+use tracing;
 use pasetors::claims::Claims;
 use pasetors::keys::AsymmetricPublicKey;
 use pasetors::version3::UncompressedPublicKey;
@@ -184,8 +184,8 @@ type KmsSignError = aws_sdk_kms::error::SdkError<aws_sdk_kms::operation::sign::S
 type KmsGetPublicKeyError =
     aws_sdk_kms::error::SdkError<aws_sdk_kms::operation::get_public_key::GetPublicKeyError>;
 
-impl From<KmsError> for RouterError {
-    /// Mapping policy, deliberately explicit because `RouterError` variants
+impl From<KmsError> for TokenError {
+    /// Mapping policy, deliberately explicit because `TokenError` variants
     /// carry HTTP status codes:
     ///
     /// * **401 `Unauthenticated`** â€” the caller's token or claims could not be
@@ -199,11 +199,11 @@ impl From<KmsError> for RouterError {
     ///   and must not be reported to the client as an auth failure.
     fn from(err: KmsError) -> Self {
         match err {
-            KmsError::ClaimsSerialization(e) => RouterError::Unauthenticated(e.to_string()),
-            KmsError::DerToRaw(e) => RouterError::Unauthenticated(e),
-            KmsError::Pasetors(e) => RouterError::Unauthenticated(e.to_string()),
-            KmsError::Base64(e) => RouterError::Unauthenticated(e.to_string()),
-            other => RouterError::KeyPairError(other.to_string()),
+            KmsError::ClaimsSerialization(e) => TokenError::Unauthenticated(e.to_string()),
+            KmsError::DerToRaw(e) => TokenError::Unauthenticated(e),
+            KmsError::Pasetors(e) => TokenError::Unauthenticated(e.to_string()),
+            KmsError::Base64(e) => TokenError::Unauthenticated(e.to_string()),
+            other => TokenError::KeyPairError(other.to_string()),
         }
     }
 }
@@ -1107,9 +1107,9 @@ mod test {
             KmsError::Pasetors(pasetors::errors::Error::Key),
         ];
         for err in crypto {
-            let mapped: RouterError = err.into();
+            let mapped: TokenError = err.into();
             assert!(
-                matches!(mapped, RouterError::Unauthenticated(_)),
+                matches!(mapped, TokenError::Unauthenticated(_)),
                 "crypto failure must map to 401"
             );
         }
@@ -1127,9 +1127,9 @@ mod test {
             KmsError::PaeOverflow("x".to_string()),
         ];
         for err in config {
-            let mapped: RouterError = err.into();
+            let mapped: TokenError = err.into();
             assert!(
-                matches!(mapped, RouterError::KeyPairError(_)),
+                matches!(mapped, TokenError::KeyPairError(_)),
                 "configuration failure must map to 500"
             );
         }
