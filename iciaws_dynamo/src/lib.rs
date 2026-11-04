@@ -256,7 +256,10 @@ impl DynamoClient {
         limit: Option<i32>,
         tablename: Option<&str>,
     ) -> Result<QueryOutput, DynamoError> {
-        let qo = self.client.query().table_name(tablename.unwrap_or(&self.table_name))
+        let qo = self
+            .client
+            .query()
+            .table_name(tablename.unwrap_or(&self.table_name))
             .key_condition_expression("pk = :hashKey and begins_with(sk, :prefix)")
             .expression_attribute_values(":hashKey", AttributeValue::S(pk.to_string()))
             .expression_attribute_values(":prefix", AttributeValue::S(sk_prefix.to_string()))
@@ -443,6 +446,53 @@ impl DynamoClient {
         Ok(qo)
     }
 
+    /// Query against a GSI with hash key (ignore the sort key) and filter with some non-key attributes.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `gsi` - GSI index name like 'gsi1-index'
+    /// * `pk_name` - GSI hash key, like 'gsi1pk'
+    /// * `pk_val` - GSI hash key value to match
+    /// * `filter` - filter expression like '#hashKey = :hashKey'
+    /// * `filter_name` - expression name map: {"#hashKey": "gsi1pk"}
+    /// * `filter_val` - expression value map: {":hashKey": "App#101"}
+    /// * `forward` - forward(true) or backward scan (sort asending or descending)
+    /// * `last_key_str` - page start key, None from beginning
+    /// * `limit` - page size, None = default by DynamoDB
+    /// * `tablename` - optional table name to use
+    pub async fn query_gsi_page_by_pk_with_filter(
+        &self,
+        gsi: &str,
+        pk_name: &str,
+        pk_val: &str,
+        filter: &str,
+        filter_name: Option<HashMap<String, String>>,
+        filter_val: Option<HashMap<String, AttributeValue>>,
+        forward: bool,
+        last_key_str: Option<String>,
+        limit: Option<i32>,
+        tablename: Option<&str>,
+    ) -> Result<QueryOutput, DynamoError> {
+        let qo = self
+            .client
+            .query()
+            .table_name(tablename.unwrap_or(&self.table_name))
+            .index_name(gsi)
+            .key_condition_expression("#pk = :pk")
+            .set_filter_expression(Some(filter.to_string()))
+            .set_expression_attribute_names(filter_name)
+            .set_expression_attribute_values(filter_val)
+            .expression_attribute_names("#pk", pk_name)
+            .expression_attribute_values(":pk", AttributeValue::S(pk_val.to_string()))
+            .scan_index_forward(forward)
+            .set_limit(limit)
+            .set_exclusive_start_key(make_start_key(last_key_str))
+            .send()
+            .await
+            .map_err(|e| DynamoError::DynDbError(format!("{}", DisplayErrorContext(e))))?;
+        Ok(qo)
+    }
+
     /// Query by pk with a filter expression for short dataset (no pagination necessary)
     ///
     /// # Arguments
@@ -583,7 +633,7 @@ impl DynamoClient {
     }
 
     /// Scan with a FilterExpression especially for pk with a shared prefix, like 'User#'
-    /// 
+    ///
     /// ```rust,ignore
     /// let filterExp = "begins_with(#pk, :pkv)";
     /// let ean = HashMap::from([("#pk".to_owned(), "pk".to_owned())]);
