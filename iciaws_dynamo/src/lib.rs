@@ -617,14 +617,14 @@ impl DynamoClient {
 
     pub async fn scan_with_filter(
         &self,
-        filter: FilterType,
+        filter: Option<FilterType>,
         tablename: Option<&str>,
     ) -> Result<ScanOutput, DynamoError> {
         let so = self
             .client
             .scan()
             .table_name(tablename.unwrap_or(&self.table_name))
-            .set_scan_filter(Some(filter))
+            .set_scan_filter(filter)
             .send()
             .await
             .map_err(|e| DynamoError::DynDbError(format!("{}", DisplayErrorContext(e))))?;
