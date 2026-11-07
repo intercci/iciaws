@@ -618,6 +618,7 @@ impl DynamoClient {
     pub async fn scan_with_filter(
         &self,
         filter: Option<FilterType>,
+        last_key_str: Option<String>,
         tablename: Option<&str>,
     ) -> Result<ScanOutput, DynamoError> {
         let so = self
@@ -625,6 +626,7 @@ impl DynamoClient {
             .scan()
             .table_name(tablename.unwrap_or(&self.table_name))
             .set_scan_filter(filter)
+            .set_exclusive_start_key(make_start_key(last_key_str))
             .send()
             .await
             .map_err(|e| DynamoError::DynDbError(format!("{}", DisplayErrorContext(e))))?;
