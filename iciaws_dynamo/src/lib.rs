@@ -132,6 +132,38 @@ impl DynamoClient {
         Ok(bo)
     }
 
+    /// Batch write item for both put and delete
+    /// 
+    /// # Args
+    /// 
+    /// * `records` - list of tuple of an operation ("put" or "delete") and an item or key as ItemType
+    /// * `tablename` - optional table name
+    pub async fn batch_put_or_delete(&self, records: Vec<(String, ItemType)>, tablename: Option<&str>) -> Result<BatchWriteItemOutput, DynamoError> {
+        let rs = records.into_iter().map(|rec| {
+            if rec.0.eq_ignore_ascii_case("put") {
+                WriteRequest::builder().set_put_request(Some(
+                    PutRequest::builder().set_item(Some(rec.1)).build().unwrap(),
+                )).build()
+            } else {
+                WriteRequest::builder().set_delete_request(Some(
+                    DeleteRequest::builder().set_key(Some(rec.1)).build().unwrap(),
+                )).build()
+            }
+        }).collect::<Vec<WriteRequest>>();
+
+        let reqs = HashMap::from([(tablename.unwrap_or(&self.table_name).to_string(), rs)]);
+
+        let bo = self
+            .client
+            .batch_write_item()
+            .set_request_items(Some(reqs))
+            .send()
+            .await
+            .map_err(|e| DynamoError::DynDbError(format!("{}", DisplayErrorContext(e))))?;
+
+        Ok(bo)
+    }
+
     pub async fn batch_get(
         &self,
         keys: Vec<ItemType>,
